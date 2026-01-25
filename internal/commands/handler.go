@@ -58,11 +58,10 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		return resp.Error("ERR wrong number of arguments for 'PING'")
 
 	case "SET":
+		// Hold read lock for entire operation to ensure readOnly and master remain consistent.
 		h.mu.RLock()
-		readOnly := h.readOnly
-		master := h.master
-		h.mu.RUnlock()
-		if readOnly {
+		defer h.mu.RUnlock()
+		if h.readOnly {
 			return resp.Error("READONLY You can't write against a read only replica.")
 		}
 		// Supported:
@@ -107,9 +106,9 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		}
 
 		// Broadcast to replicas (best-effort, async replication).
-		if master != nil {
+		if h.master != nil {
 			op := aof.RecordSetAt(key, val, expireAtMs)
-			master.BroadcastOp(ctx, op)
+			h.master.BroadcastOp(ctx, op)
 			// Note: BroadcastOp doesn't return errors by design (async replication).
 			// Failed replicas are automatically removed by the master.
 		}
@@ -130,11 +129,10 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		return resp.BulkString(v)
 
 	case "DEL":
+		// Hold read lock for entire operation to ensure readOnly and master remain consistent.
 		h.mu.RLock()
-		readOnly := h.readOnly
-		master := h.master
-		h.mu.RUnlock()
-		if readOnly {
+		defer h.mu.RUnlock()
+		if h.readOnly {
 			return resp.Error("READONLY You can't write against a read only replica.")
 		}
 		if len(args) != 2 {
@@ -147,20 +145,19 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		}
 		if deleted {
 			// Broadcast to replicas (best-effort, async replication).
-			if master != nil {
+			if h.master != nil {
 				op := aof.RecordDel(key)
-				master.BroadcastOp(ctx, op)
+				h.master.BroadcastOp(ctx, op)
 			}
 			return resp.Integer(1)
 		}
 		return resp.Integer(0)
 
 	case "EXPIRE":
+		// Hold read lock for entire operation to ensure readOnly and master remain consistent.
 		h.mu.RLock()
-		readOnly := h.readOnly
-		master := h.master
-		h.mu.RUnlock()
-		if readOnly {
+		defer h.mu.RUnlock()
+		if h.readOnly {
 			return resp.Error("READONLY You can't write against a read only replica.")
 		}
 		if len(args) != 3 {
@@ -178,21 +175,20 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		}
 		if updated {
 			// Broadcast to replicas (best-effort, async replication).
-			if master != nil {
+			if h.master != nil {
 				expireAtMs := time.Now().Add(ttl).UnixMilli()
 				op := aof.RecordExpireAt(key, expireAtMs)
-				master.BroadcastOp(ctx, op)
+				h.master.BroadcastOp(ctx, op)
 			}
 			return resp.Integer(1)
 		}
 		return resp.Integer(0)
 
 	case "PEXPIRE":
+		// Hold read lock for entire operation to ensure readOnly and master remain consistent.
 		h.mu.RLock()
-		readOnly := h.readOnly
-		master := h.master
-		h.mu.RUnlock()
-		if readOnly {
+		defer h.mu.RUnlock()
+		if h.readOnly {
 			return resp.Error("READONLY You can't write against a read only replica.")
 		}
 		if len(args) != 3 {
@@ -210,10 +206,10 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		}
 		if updated {
 			// Broadcast to replicas (best-effort, async replication).
-			if master != nil {
+			if h.master != nil {
 				expireAtMs := time.Now().Add(ttl).UnixMilli()
 				op := aof.RecordExpireAt(key, expireAtMs)
-				master.BroadcastOp(ctx, op)
+				h.master.BroadcastOp(ctx, op)
 			}
 			return resp.Integer(1)
 		}

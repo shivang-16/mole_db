@@ -73,10 +73,12 @@ func (s *LoggingStore) TTL(ctx context.Context, key string) (time.Duration, bool
 
 func (s *LoggingStore) Set(ctx context.Context, key string, value []byte) error {
 	ttl := s.defaultTTL
-	expireAtMs := s.now().Add(ttl).UnixMilli()
+	// Normalize TTL for consistency with SetWithTTL() and Expire() methods.
+	eff := normalizeTTL(ttl, s.defaultTTL, s.maxTTL)
+	expireAtMs := s.now().Add(eff).UnixMilli()
 
 	// Use SetWithTTL to ensure underlying store and AOF log use consistent TTL.
-	if err := s.underlying.SetWithTTL(ctx, key, value, ttl); err != nil {
+	if err := s.underlying.SetWithTTL(ctx, key, value, eff); err != nil {
 		return err
 	}
 	return s.w.AppendRecord(RecordSetAt(key, value, expireAtMs))

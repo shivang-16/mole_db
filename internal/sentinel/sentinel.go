@@ -88,9 +88,12 @@ func (s *Sentinel) checkMaster(ctx context.Context) {
 		s.failoverInProgress = true
 		s.mu.Unlock()
 
-		// Spawn failover goroutine with deferred flag reset.
+		// Spawn failover goroutine with deferred flag reset and panic recovery.
 		go func() {
 			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("sentinel: panic in failover goroutine: %v", r)
+				}
 				s.mu.Lock()
 				s.failoverInProgress = false
 				s.mu.Unlock()
@@ -234,6 +237,10 @@ func (s *Sentinel) promoteReplica(ctx context.Context, replicaAddr string) error
 	}
 
 	// Wait for and validate replica's response to ensure promotion succeeded.
+	// Set read deadline to prevent indefinite blocking if replica doesn't respond.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("failed to set read deadline: %w", err)
+	}
 	buf := make([]byte, 100)
 	n, err := conn.Read(buf)
 	if err != nil || n == 0 {

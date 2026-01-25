@@ -106,6 +106,9 @@ func (s *MemoryStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 		// Need to delete - upgrade to write lock.
 		sh.mu.RUnlock()
 		sh.mu.Lock()
+		// Recalculate time after acquiring write lock (TOCTOU protection).
+		nowMs = s.now().UnixMilli()
+		nowSec = nowMs / 1000
 		// Re-check under write lock (key might have been deleted/modified).
 		e2, ok2 := sh.kv[key]
 		if !ok2 {
@@ -126,6 +129,9 @@ func (s *MemoryStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 		// Not expired - upgrade to write lock to update LRU.
 		sh.mu.RUnlock()
 		sh.mu.Lock()
+		// Recalculate time after acquiring write lock (TOCTOU protection).
+		nowMs = s.now().UnixMilli()
+		nowSec = nowMs / 1000
 		// Re-check key still exists (might have been deleted).
 		e2, ok2 := sh.kv[key]
 		if !ok2 {
