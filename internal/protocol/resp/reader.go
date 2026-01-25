@@ -24,8 +24,9 @@ func NewReader(rd io.Reader) *Reader {
 	return &Reader{r: bufio.NewReader(rd)}
 }
 
-// ReadCommand returns a command as ["CMD", "arg1", ...].
-func (rr *Reader) ReadCommand() ([]string, error) {
+// ReadCommand returns a command as [[]byte("CMD"), []byte("arg1"), ...].
+// All arguments are kept as raw bytes for binary-safety.
+func (rr *Reader) ReadCommand() ([][]byte, error) {
 	b, err := rr.r.Peek(1)
 	if err != nil {
 		return nil, err
@@ -36,7 +37,7 @@ func (rr *Reader) ReadCommand() ([]string, error) {
 	return rr.readInline()
 }
 
-func (rr *Reader) readArrayOfBulkStrings() ([]string, error) {
+func (rr *Reader) readArrayOfBulkStrings() ([][]byte, error) {
 	line, err := rr.readLine()
 	if err != nil {
 		return nil, err
@@ -49,7 +50,7 @@ func (rr *Reader) readArrayOfBulkStrings() ([]string, error) {
 		return nil, fmt.Errorf("%w: bad array length", ErrProtocol)
 	}
 
-	out := make([]string, 0, n)
+	out := make([][]byte, 0, n)
 	for i := 0; i < n; i++ {
 		h, err := rr.readLine()
 		if err != nil {
@@ -64,7 +65,7 @@ func (rr *Reader) readArrayOfBulkStrings() ([]string, error) {
 			return nil, fmt.Errorf("%w: bad bulk length", ErrProtocol)
 		}
 		if l == -1 {
-			out = append(out, "")
+			out = append(out, nil)
 			continue
 		}
 
@@ -76,14 +77,13 @@ func (rr *Reader) readArrayOfBulkStrings() ([]string, error) {
 			return nil, fmt.Errorf("%w: missing CRLF after bulk string", ErrProtocol)
 		}
 
-		// Note: this converts bytes to string. For now Mole commands are stringly-typed.
-		// If we add binary-safe keys/values later, we'll pass []byte through instead.
-		out = append(out, string(buf[:l]))
+		// Keep as raw bytes for binary-safety.
+		out = append(out, buf[:l])
 	}
 	return out, nil
 }
 
-func (rr *Reader) readInline() ([]string, error) {
+func (rr *Reader) readInline() ([][]byte, error) {
 	line, err := rr.readLine()
 	if err != nil {
 		return nil, err
@@ -93,9 +93,9 @@ func (rr *Reader) readInline() ([]string, error) {
 		return nil, fmt.Errorf("%w: empty command", ErrProtocol)
 	}
 	parts := bytes.Fields(line)
-	out := make([]string, 0, len(parts))
+	out := make([][]byte, 0, len(parts))
 	for _, p := range parts {
-		out = append(out, string(p))
+		out = append(out, p)
 	}
 	return out, nil
 }

@@ -18,10 +18,16 @@ type Config struct {
 type Server struct {
 	cfg     Config
 	handler *commands.Handler
+	master  interface{ AddReplica(net.Conn) error } // replication.Master interface
 }
 
 func New(cfg Config, handler *commands.Handler) *Server {
 	return &Server{cfg: cfg, handler: handler}
+}
+
+// SetMaster sets the master for accepting replica connections.
+func (s *Server) SetMaster(m interface{ AddReplica(net.Conn) error }) {
+	s.master = m
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {

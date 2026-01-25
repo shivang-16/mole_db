@@ -7,24 +7,39 @@ import (
 	"time"
 
 	"mole/internal/core"
+	"mole/internal/persistence/aof"
 	"mole/internal/protocol/resp"
+	"mole/internal/replication"
 )
 
 type Handler struct {
-	store core.Store
+	store    core.Store
+	readOnly bool
+	master   *replication.Master // nil if not master
 }
 
 func NewHandler(store core.Store) *Handler {
 	return &Handler{store: store}
 }
 
+// SetReadOnly marks the handler as read-only (for replicas).
+func (h *Handler) SetReadOnly(readOnly bool) {
+	h.readOnly = readOnly
+}
+
+// SetMaster sets the master for broadcasting writes (for masters).
+func (h *Handler) SetMaster(master *replication.Master) {
+	h.master = master
+}
+
 // Handle executes a parsed command and returns a RESP reply.
-func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
+// Args are binary-safe byte slices.
+func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 	if len(args) == 0 {
 		return resp.Error("ERR empty command")
 	}
 
-	cmd := strings.ToUpper(args[0])
+	cmd := strings.ToUpper(string(args[0]))
 	switch cmd {
 	case "PING":
 		// PING or PING <message>
@@ -32,11 +47,14 @@ func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
 			return resp.SimpleString("PONG")
 		}
 		if len(args) == 2 {
-			return resp.BulkString([]byte(args[1]))
+			return resp.BulkString(args[1])
 		}
 		return resp.Error("ERR wrong number of arguments for 'PING'")
 
 	case "SET":
+		if h.readOnly {
+			return resp.Error("READONLY You can't write against a read only replica.")
+		}
 		// Supported:
 		// - SET key value
 		// - SET key value EX <seconds>
@@ -44,41 +62,53 @@ func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
 		if len(args) != 3 && len(args) != 5 {
 			return resp.Error("ERR wrong number of arguments for 'SET'")
 		}
-		key := args[1]
-		val := []byte(args[2])
+		key := string(args[1])
+		val := args[2]
 
+		var expireAtMs int64
 		if len(args) == 3 {
+			// Use default TTL (we'll need to get it from store or config).
+			// For now, use a reasonable default (20 days).
+			defaultTTL := 20 * 24 * time.Hour
 			if err := h.store.Set(ctx, key, val); err != nil {
 				return resp.Error("ERR " + err.Error())
 			}
-			return resp.SimpleString("OK")
+			expireAtMs = time.Now().Add(defaultTTL).UnixMilli()
+		} else {
+			unit := strings.ToUpper(string(args[3]))
+			n, err := parsePositiveInt64Bytes(args[4])
+			if err != nil {
+				return resp.Error("ERR invalid expire time in SET")
+			}
+			var ttl time.Duration
+			switch unit {
+			case "EX":
+				ttl = time.Duration(n) * time.Second
+			case "PX":
+				ttl = time.Duration(n) * time.Millisecond
+			default:
+				return resp.Error("ERR syntax error")
+			}
+
+			if err := h.store.SetWithTTL(ctx, key, val, ttl); err != nil {
+				return resp.Error("ERR " + err.Error())
+			}
+			expireAtMs = time.Now().Add(ttl).UnixMilli()
 		}
 
-		unit := strings.ToUpper(args[3])
-		n, err := parsePositiveInt64(args[4])
-		if err != nil {
-			return resp.Error("ERR invalid expire time in SET")
-		}
-		var ttl time.Duration
-		switch unit {
-		case "EX":
-			ttl = time.Duration(n) * time.Second
-		case "PX":
-			ttl = time.Duration(n) * time.Millisecond
-		default:
-			return resp.Error("ERR syntax error")
+		// Broadcast to replicas.
+		if h.master != nil {
+			op := aof.RecordSetAt(key, val, expireAtMs)
+			h.master.BroadcastOp(ctx, op)
 		}
 
-		if err := h.store.SetWithTTL(ctx, key, val, ttl); err != nil {
-			return resp.Error("ERR " + err.Error())
-		}
 		return resp.SimpleString("OK")
 
 	case "GET":
 		if len(args) != 2 {
 			return resp.Error("ERR wrong number of arguments for 'GET'")
 		}
-		v, ok, err := h.store.Get(ctx, args[1])
+		v, ok, err := h.store.Get(ctx, string(args[1]))
 		if err != nil {
 			return resp.Error("ERR " + err.Error())
 		}
@@ -88,48 +118,79 @@ func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
 		return resp.BulkString(v)
 
 	case "DEL":
+		if h.readOnly {
+			return resp.Error("READONLY You can't write against a read only replica.")
+		}
 		if len(args) != 2 {
 			return resp.Error("ERR wrong number of arguments for 'DEL'")
 		}
-		deleted, err := h.store.Del(ctx, args[1])
+		key := string(args[1])
+		deleted, err := h.store.Del(ctx, key)
 		if err != nil {
 			return resp.Error("ERR " + err.Error())
 		}
 		if deleted {
+			// Broadcast to replicas.
+			if h.master != nil {
+				op := aof.RecordDel(key)
+				h.master.BroadcastOp(ctx, op)
+			}
 			return resp.Integer(1)
 		}
 		return resp.Integer(0)
 
 	case "EXPIRE":
+		if h.readOnly {
+			return resp.Error("READONLY You can't write against a read only replica.")
+		}
 		if len(args) != 3 {
 			return resp.Error("ERR wrong number of arguments for 'EXPIRE'")
 		}
-		secs, err := parsePositiveInt64(args[2])
+		key := string(args[1])
+		secs, err := parsePositiveInt64Bytes(args[2])
 		if err != nil {
 			return resp.Error("ERR value is not an integer or out of range")
 		}
-		updated, err := h.store.Expire(ctx, args[1], time.Duration(secs)*time.Second)
+		ttl := time.Duration(secs) * time.Second
+		updated, err := h.store.Expire(ctx, key, ttl)
 		if err != nil {
 			return resp.Error("ERR " + err.Error())
 		}
 		if updated {
+			// Broadcast to replicas.
+			if h.master != nil {
+				expireAtMs := time.Now().Add(ttl).UnixMilli()
+				op := aof.RecordExpireAt(key, expireAtMs)
+				h.master.BroadcastOp(ctx, op)
+			}
 			return resp.Integer(1)
 		}
 		return resp.Integer(0)
 
 	case "PEXPIRE":
+		if h.readOnly {
+			return resp.Error("READONLY You can't write against a read only replica.")
+		}
 		if len(args) != 3 {
 			return resp.Error("ERR wrong number of arguments for 'PEXPIRE'")
 		}
-		ms, err := parsePositiveInt64(args[2])
+		key := string(args[1])
+		ms, err := parsePositiveInt64Bytes(args[2])
 		if err != nil {
 			return resp.Error("ERR value is not an integer or out of range")
 		}
-		updated, err := h.store.Expire(ctx, args[1], time.Duration(ms)*time.Millisecond)
+		ttl := time.Duration(ms) * time.Millisecond
+		updated, err := h.store.Expire(ctx, key, ttl)
 		if err != nil {
 			return resp.Error("ERR " + err.Error())
 		}
 		if updated {
+			// Broadcast to replicas.
+			if h.master != nil {
+				expireAtMs := time.Now().Add(ttl).UnixMilli()
+				op := aof.RecordExpireAt(key, expireAtMs)
+				h.master.BroadcastOp(ctx, op)
+			}
 			return resp.Integer(1)
 		}
 		return resp.Integer(0)
@@ -138,7 +199,7 @@ func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
 		if len(args) != 2 {
 			return resp.Error("ERR wrong number of arguments for 'TTL'")
 		}
-		ttl, ok, err := h.store.TTL(ctx, args[1])
+		ttl, ok, err := h.store.TTL(ctx, string(args[1]))
 		if err != nil {
 			return resp.Error("ERR " + err.Error())
 		}
@@ -152,7 +213,7 @@ func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
 		if len(args) != 2 {
 			return resp.Error("ERR wrong number of arguments for 'PTTL'")
 		}
-		ttl, ok, err := h.store.TTL(ctx, args[1])
+		ttl, ok, err := h.store.TTL(ctx, string(args[1]))
 		if err != nil {
 			return resp.Error("ERR " + err.Error())
 		}
@@ -166,8 +227,8 @@ func (h *Handler) Handle(ctx context.Context, args []string) resp.Reply {
 	}
 }
 
-func parsePositiveInt64(s string) (int64, error) {
-	n, err := strconv.ParseInt(s, 10, 64)
+func parsePositiveInt64Bytes(b []byte) (int64, error) {
+	n, err := strconv.ParseInt(string(b), 10, 64)
 	if err != nil || n <= 0 {
 		return 0, strconv.ErrRange
 	}
