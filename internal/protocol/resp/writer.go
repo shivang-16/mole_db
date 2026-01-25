@@ -49,3 +49,16 @@ func (wr *Writer) WriteBulkString(b []byte) error {
 	_, err := wr.w.WriteString("\r\n")
 	return err
 }
+
+// WriteArray writes a RESP array of bulk strings.
+func (wr *Writer) WriteArray(args [][]byte) error {
+	if _, err := wr.w.WriteString("*" + strconv.Itoa(len(args)) + "\r\n"); err != nil {
+		return err
+	}
+	for _, arg := range args {
+		if err := wr.WriteBulkString(arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
