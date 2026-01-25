@@ -14,6 +14,11 @@ import (
 //
 // It computes the effective TTL using the same policy values used by MemoryStore,
 // then records absolute expireAt timestamps so replay does not extend key lifetimes.
+//
+// Write pattern: write-after (memory first, then AOF), same as Redis.
+// If AOF append fails, the write is already committed to memory.
+// This is acceptable for async replication - AOF failures are logged but don't
+// rollback memory operations (which would be incorrect for async replication).
 type LoggingStore struct {
 	underlying core.Store
 	w          *Writer
@@ -70,7 +75,8 @@ func (s *LoggingStore) Set(ctx context.Context, key string, value []byte) error 
 	ttl := s.defaultTTL
 	expireAtMs := s.now().Add(ttl).UnixMilli()
 
-	if err := s.underlying.Set(ctx, key, value); err != nil {
+	// Use SetWithTTL to ensure underlying store and AOF log use consistent TTL.
+	if err := s.underlying.SetWithTTL(ctx, key, value, ttl); err != nil {
 		return err
 	}
 	return s.w.AppendRecord(RecordSetAt(key, value, expireAtMs))
@@ -80,7 +86,8 @@ func (s *LoggingStore) SetWithTTL(ctx context.Context, key string, value []byte,
 	eff := normalizeTTL(ttl, s.defaultTTL, s.maxTTL)
 	expireAtMs := s.now().Add(eff).UnixMilli()
 
-	if err := s.underlying.SetWithTTL(ctx, key, value, ttl); err != nil {
+	// Pass normalized TTL to underlying store to ensure consistency with AOF log.
+	if err := s.underlying.SetWithTTL(ctx, key, value, eff); err != nil {
 		return err
 	}
 	return s.w.AppendRecord(RecordSetAt(key, value, expireAtMs))
@@ -89,11 +96,12 @@ func (s *LoggingStore) SetWithTTL(ctx context.Context, key string, value []byte,
 func (s *LoggingStore) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	eff := normalizeTTL(ttl, s.defaultTTL, s.maxTTL)
 	if eff <= 0 {
-		return s.underlying.Expire(ctx, key, ttl)
+		return s.underlying.Expire(ctx, key, eff)
 	}
 	expireAtMs := s.now().Add(eff).UnixMilli()
 
-	updated, err := s.underlying.Expire(ctx, key, ttl)
+	// Pass normalized TTL to underlying store to ensure consistency with AOF log.
+	updated, err := s.underlying.Expire(ctx, key, eff)
 	if err != nil || !updated {
 		return updated, err
 	}

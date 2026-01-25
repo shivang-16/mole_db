@@ -18,8 +18,9 @@ type Master struct {
 }
 
 type replicaConn struct {
-	conn net.Conn
-	wr   *resp.Writer
+	conn   net.Conn
+	wr     *resp.Writer
+	cancel context.CancelFunc
 }
 
 func NewMaster(store core.Store) *Master {
@@ -34,20 +35,24 @@ func (m *Master) AddReplica(conn net.Conn) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Create cancellable context for this replica connection.
+	ctx, cancel := context.WithCancel(context.Background())
+
 	rc := &replicaConn{
-		conn: conn,
-		wr:   resp.NewWriter(conn),
+		conn:   conn,
+		wr:     resp.NewWriter(conn),
+		cancel: cancel,
 	}
 	m.replicas[conn] = rc
 
 	// Send full snapshot to new replica.
 	go func() {
 		defer m.RemoveReplica(conn)
-		if err := m.sendSnapshot(context.Background(), rc); err != nil {
+		if err := m.sendSnapshot(ctx, rc); err != nil {
 			return
 		}
 		// After snapshot, stream live updates.
-		m.streamToReplica(context.Background(), rc)
+		m.streamToReplica(ctx, rc)
 	}()
 
 	return nil
@@ -56,8 +61,16 @@ func (m *Master) AddReplica(conn net.Conn) error {
 // RemoveReplica removes a replica connection.
 func (m *Master) RemoveReplica(conn net.Conn) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.replicas, conn)
+	rc, ok := m.replicas[conn]
+	if ok {
+		delete(m.replicas, conn)
+	}
+	m.mu.Unlock()
+
+	if ok && rc.cancel != nil {
+		// Cancel context to stop goroutines before closing connection.
+		rc.cancel()
+	}
 	_ = conn.Close()
 }
 
@@ -70,6 +83,8 @@ func (m *Master) BroadcastOp(ctx context.Context, op [][]byte) {
 	}
 	m.mu.RUnlock()
 
+	// Collect failed replicas to remove after iteration to avoid lock contention.
+	var failedReplicas []net.Conn
 	for _, rc := range replicas {
 		select {
 		case <-ctx.Done():
@@ -79,28 +94,61 @@ func (m *Master) BroadcastOp(ctx context.Context, op [][]byte) {
 
 		// Write RESP array.
 		if err := writeOp(rc.wr, op); err != nil {
-			m.RemoveReplica(rc.conn)
+			failedReplicas = append(failedReplicas, rc.conn)
 			continue
 		}
 		if err := rc.wr.Flush(); err != nil {
-			m.RemoveReplica(rc.conn)
+			failedReplicas = append(failedReplicas, rc.conn)
 			continue
 		}
+	}
+
+	// Remove failed replicas after iteration completes.
+	for _, conn := range failedReplicas {
+		m.RemoveReplica(conn)
 	}
 }
 
 // sendSnapshot sends the full state of the store to a replica.
 func (m *Master) sendSnapshot(ctx context.Context, rc *replicaConn) error {
+	// Collect snapshot data first (without network I/O) to avoid blocking locks.
+	type snapshotEntry struct {
+		key        string
+		value      []byte
+		expireAtMs int64
+	}
+	var snapshot []snapshotEntry
+
 	// Try to get snapshot iterator from MemoryStore.
 	if memStore, ok := m.store.(*core.MemoryStore); ok {
 		err := memStore.IterateAllKeys(ctx, func(key string, value []byte, expireAtMs int64) error {
-			op := aof.RecordSetAt(key, value, expireAtMs)
-			if err := writeOp(rc.wr, op); err != nil {
-				return err
-			}
-			return rc.wr.Flush()
+			// Defensive copy of value.
+			valCopy := make([]byte, len(value))
+			copy(valCopy, value)
+			snapshot = append(snapshot, snapshotEntry{
+				key:        key,
+				value:      valCopy,
+				expireAtMs: expireAtMs,
+			})
+			return nil
 		})
 		if err != nil {
+			return err
+		}
+	}
+
+	// Now perform network I/O without holding any locks.
+	for _, entry := range snapshot {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		op := aof.RecordSetAt(entry.key, entry.value, entry.expireAtMs)
+		if err := writeOp(rc.wr, op); err != nil {
+			return err
+		}
+		if err := rc.wr.Flush(); err != nil {
 			return err
 		}
 	}

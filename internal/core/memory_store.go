@@ -93,20 +93,46 @@ func (s *MemoryStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 	nowSec := nowMs / 1000
 	sh := s.shardFor(key)
 
-	sh.mu.Lock()
+	// Start with read lock for the common case (key exists, not expired).
+	sh.mu.RLock()
 	e, ok := sh.kv[key]
 	if !ok {
-		sh.mu.Unlock()
+		sh.mu.RUnlock()
 		return nil, false, nil
 	}
 
+	// Check if expired.
 	if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
-		// Passive expiry: delete on read.
-		size := entrySize(key, e.value)
-		delete(sh.kv, key)
-		sh.mu.Unlock()
-		atomic.AddInt64(&s.usedMemory, -size)
-		return nil, false, nil
+		// Need to delete - upgrade to write lock.
+		sh.mu.RUnlock()
+		sh.mu.Lock()
+		// Re-check under write lock (key might have been deleted/modified).
+		e2, ok2 := sh.kv[key]
+		if !ok2 {
+			sh.mu.Unlock()
+			return nil, false, nil
+		}
+		if e2.expireAtMs > 0 && nowMs >= e2.expireAtMs {
+			// Still expired - delete it.
+			size := entrySize(key, e2.value)
+			delete(sh.kv, key)
+			sh.mu.Unlock()
+			atomic.AddInt64(&s.usedMemory, -size)
+			return nil, false, nil
+		}
+		// Key was updated (expiry extended) - update LRU with current entry.
+		e = e2
+	} else {
+		// Not expired - upgrade to write lock to update LRU.
+		sh.mu.RUnlock()
+		sh.mu.Lock()
+		// Re-check key still exists (might have been deleted).
+		e2, ok2 := sh.kv[key]
+		if !ok2 {
+			sh.mu.Unlock()
+			return nil, false, nil
+		}
+		e = e2
 	}
 
 	// Update LRU access time.
@@ -150,6 +176,13 @@ func (s *MemoryStore) SetWithTTL(ctx context.Context, key string, value []byte, 
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	oldEntry, existed := sh.kv[key]
+
+	// Calculate oldSize while lock is held to avoid race condition.
+	var oldSize int64
+	if existed {
+		oldSize = entrySize(key, oldEntry.value)
+	}
+
 	sh.kv[key] = entry{
 		value:          v,
 		expireAtMs:     expireAt,
@@ -157,9 +190,8 @@ func (s *MemoryStore) SetWithTTL(ctx context.Context, key string, value []byte, 
 	}
 	sh.mu.Unlock()
 
-	// Update memory counter.
+	// Update memory counter using pre-calculated values.
 	if existed {
-		oldSize := entrySize(key, oldEntry.value)
 		atomic.AddInt64(&s.usedMemory, newSize-oldSize)
 	} else {
 		atomic.AddInt64(&s.usedMemory, newSize)
@@ -383,8 +415,17 @@ func entrySize(key string, value []byte) int64 {
 // IterateAllKeys calls fn for every key/value/expireAt in the store.
 // Used for replication snapshots.
 func (s *MemoryStore) IterateAllKeys(ctx context.Context, fn func(key string, value []byte, expireAtMs int64) error) error {
+	type snapshotEntry struct {
+		key        string
+		value      []byte
+		expireAtMs int64
+	}
+
 	for i := range s.shards {
 		sh := &s.shards[i]
+
+		// Snapshot all entries while holding the lock.
+		var snapshot []snapshotEntry
 		sh.mu.RLock()
 		for k, e := range sh.kv {
 			select {
@@ -396,12 +437,25 @@ func (s *MemoryStore) IterateAllKeys(ctx context.Context, fn func(key string, va
 			// Defensive copy of value.
 			valCopy := make([]byte, len(e.value))
 			copy(valCopy, e.value)
-			if err := fn(k, valCopy, e.expireAtMs); err != nil {
-				sh.mu.RUnlock()
+			snapshot = append(snapshot, snapshotEntry{
+				key:        k,
+				value:      valCopy,
+				expireAtMs: e.expireAtMs,
+			})
+		}
+		sh.mu.RUnlock()
+
+		// Call callbacks without holding the lock.
+		for _, entry := range snapshot {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			if err := fn(entry.key, entry.value, entry.expireAtMs); err != nil {
 				return err
 			}
 		}
-		sh.mu.RUnlock()
 	}
 	return nil
 }

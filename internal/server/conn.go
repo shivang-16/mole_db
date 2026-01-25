@@ -18,6 +18,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	rr := resp.NewReader(conn)
 	wr := resp.NewWriter(conn)
 
+	// Set deadline immediately to protect first command read from slowloris attacks.
+	_ = conn.SetDeadline(time.Now().Add(s.cfg.IdleTimeout))
+
 	// Check if this is a replica connection (first command is REPLICAOF).
 	args, err := rr.ReadCommand()
 	if err != nil {
@@ -41,7 +44,12 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			// This is a replica connection - hand it to master.
 			_ = wr.WriteSimpleString("OK")
 			_ = wr.Flush()
-			_ = s.master.AddReplica(conn)
+			if err := s.master.AddReplica(conn); err != nil {
+				_ = wr.WriteError("ERR failed to add replica: " + err.Error())
+				_ = wr.Flush()
+				_ = conn.Close()
+				return
+			}
 			return
 		}
 		_ = wr.WriteError("ERR not a master")

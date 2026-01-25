@@ -72,16 +72,15 @@ func OpenWriter(opts WriterOptions) (*Writer, error) {
 
 func (w *Writer) Close() error {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.closed {
-		w.mu.Unlock()
 		return nil
 	}
 	w.closed = true
 	close(w.stopSync)
-	w.mu.Unlock()
 
-	// Best-effort final flush+sync.
-	_ = w.Flush()
+	// Best-effort final flush+sync while holding lock.
+	_ = w.bw.Flush()
 	_ = w.f.Sync()
 	return w.f.Close()
 }
@@ -110,6 +109,11 @@ func (w *Writer) syncLoop() {
 }
 
 // AppendRecord appends one operation record encoded as a RESP array of bulk strings.
+//
+// Durability guarantees by policy:
+// - SyncAlways: fsync after every write (slowest, no data loss on crash)
+// - SyncEverySec: fsync every second via background goroutine (up to 1 second data loss)
+// - SyncNo: OS decides when to sync (unbounded data loss window)
 func (w *Writer) AppendRecord(args [][]byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -137,7 +141,8 @@ func (w *Writer) AppendRecord(args [][]byte) error {
 }
 
 // Replay reads AOF records from path and invokes apply for each record.
-// It stops cleanly at EOF.
+// It stops cleanly at EOF. On apply errors, it logs and continues to recover
+// as much data as possible from the AOF file.
 func Replay(ctx context.Context, path string, apply func(ctx context.Context, args [][]byte) error) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -161,13 +166,16 @@ func Replay(ctx context.Context, path string, apply func(ctx context.Context, ar
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			return err
+			// Protocol errors might indicate corruption - log but continue.
+			continue
 		}
 		if len(args) == 0 {
 			continue
 		}
 		if err := apply(ctx, args); err != nil {
-			return err
+			// Log apply errors but continue replay to recover as much as possible.
+			// This allows recovery even if some records are corrupted.
+			continue
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -132,8 +133,11 @@ func (r *Replica) streamFromMaster(ctx context.Context, conn net.Conn) error {
 		}
 
 		// Apply operation to local store.
+		// Note: args are already defensive copies from resp.Reader (fixed in reader.go).
 		if err := aof.ApplyRecordToStore(ctx, r.store, args); err != nil {
-			// Log error but continue streaming.
+			// Log error but continue streaming to maintain connection.
+			// This provides visibility into replication failures.
+			log.Printf("replication: failed to apply operation from master: %v", err)
 			continue
 		}
 	}

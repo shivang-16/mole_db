@@ -77,8 +77,10 @@ func (rr *Reader) readArrayOfBulkStrings() ([][]byte, error) {
 			return nil, fmt.Errorf("%w: missing CRLF after bulk string", ErrProtocol)
 		}
 
-		// Keep as raw bytes for binary-safety.
-		out = append(out, buf[:l])
+		// Create independent copy to avoid buffer reuse issues.
+		copied := make([]byte, l)
+		copy(copied, buf[:l])
+		out = append(out, copied)
 	}
 	return out, nil
 }
@@ -95,7 +97,10 @@ func (rr *Reader) readInline() ([][]byte, error) {
 	parts := bytes.Fields(line)
 	out := make([][]byte, 0, len(parts))
 	for _, p := range parts {
-		out = append(out, p)
+		// Create independent copy to avoid buffer reuse issues.
+		copied := make([]byte, len(p))
+		copy(copied, p)
+		out = append(out, copied)
 	}
 	return out, nil
 }

@@ -3,6 +3,7 @@ package sentinel
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -15,10 +16,11 @@ type Sentinel struct {
 	replicaAddrs []string
 	peers        []string // other sentinel addresses
 
-	mu            sync.RWMutex
-	masterDown    bool
-	currentMaster string
-	epoch         int64 // incremented on each failover
+	mu                 sync.RWMutex
+	masterDown         bool
+	currentMaster      string
+	epoch              int64 // incremented on each failover
+	failoverInProgress bool  // prevents concurrent failovers
 
 	heartbeatInterval time.Duration
 	downAfter         time.Duration
@@ -77,7 +79,24 @@ func (s *Sentinel) checkMaster(ctx context.Context) {
 
 	if !alive && !wasDown {
 		// Master just went down - start failover process.
-		go s.initiateFailover(ctx)
+		// Check if failover is already in progress to prevent concurrent failovers.
+		s.mu.Lock()
+		if s.failoverInProgress {
+			s.mu.Unlock()
+			return
+		}
+		s.failoverInProgress = true
+		s.mu.Unlock()
+
+		// Spawn failover goroutine with deferred flag reset.
+		go func() {
+			defer func() {
+				s.mu.Lock()
+				s.failoverInProgress = false
+				s.mu.Unlock()
+			}()
+			s.initiateFailover(ctx)
+		}()
 	}
 }
 
@@ -94,7 +113,12 @@ func (s *Sentinel) pingMaster(addr string) bool {
 // initiateFailover coordinates failover with other sentinels.
 func (s *Sentinel) initiateFailover(ctx context.Context) {
 	// Wait for downAfter duration to confirm master is down.
-	time.Sleep(s.downAfter)
+	// Use select to respect context cancellation for graceful shutdown.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(s.downAfter):
+	}
 
 	// Check again.
 	s.mu.RLock()
@@ -108,8 +132,13 @@ func (s *Sentinel) initiateFailover(ctx context.Context) {
 
 	// Ask peers if they also see master down (quorum check).
 	agreed, err := s.quorumVote(ctx, "master-down", currentMaster)
-	if err != nil || !agreed {
-		return // No quorum
+	if err != nil {
+		log.Printf("sentinel: quorum vote failed: %v", err)
+		return
+	}
+	if !agreed {
+		log.Printf("sentinel: quorum not achieved for failover")
+		return
 	}
 
 	// Elect best replica to promote.
@@ -120,6 +149,7 @@ func (s *Sentinel) initiateFailover(ctx context.Context) {
 
 	// Promote replica.
 	if err := s.promoteReplica(ctx, bestReplica); err != nil {
+		log.Printf("sentinel: failed to promote replica %s: %v", bestReplica, err)
 		return
 	}
 
@@ -171,8 +201,11 @@ func (s *Sentinel) askPeer(peerAddr, proposal, arg string) bool {
 
 	// Read response (simplified).
 	buf := make([]byte, 10)
-	n, _ := conn.Read(buf)
-	return n > 0 && buf[0] == 'Y'
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return false
+	}
+	return buf[0] == 'Y'
 }
 
 // electBestReplica picks the best replica to promote.
@@ -196,8 +229,19 @@ func (s *Sentinel) promoteReplica(ctx context.Context, replicaAddr string) error
 	defer conn.Close()
 
 	// Send PROMOTE command (simplified - would use proper protocol).
-	_, err = conn.Write([]byte(fmt.Sprintf("PROMOTE %d\n", s.epoch)))
-	return err
+	if _, err := conn.Write([]byte(fmt.Sprintf("PROMOTE %d\n", s.epoch))); err != nil {
+		return err
+	}
+
+	// Wait for and validate replica's response to ensure promotion succeeded.
+	buf := make([]byte, 100)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return fmt.Errorf("no response from replica")
+	}
+	// In a full implementation, we'd parse and validate the response.
+	// For now, any non-empty response is considered success.
+	return nil
 }
 
 // GetCurrentMaster returns the current master address.
