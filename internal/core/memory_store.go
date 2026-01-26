@@ -3,8 +3,11 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math/rand"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,8 +75,11 @@ func NewMemoryStore(opts MemoryStoreOptions) *MemoryStore {
 
 type entry struct {
 	value          []byte
-	expireAtMs     int64 // unix millis; 0 means no expiry (unused in current policy)
-	lastAccessedAt int64 // unix seconds (for LRU approximation)
+	expireAtMs     int64 // unix millis; 0 means no expiry
+	lastAccessedAt int64 // unix seconds (for LRU)
+	typ            string // "string", "hash", "list"
+	hash           map[string][]byte
+	list           [][]byte
 }
 
 type shard struct {
@@ -284,6 +290,728 @@ func (s *MemoryStore) Del(_ context.Context, key string) (bool, error) {
 	}
 	sh.mu.Unlock()
 	return false, nil
+}
+
+// Exists checks if key exists.
+func (s *MemoryStore) Exists(_ context.Context, key string) (bool, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok {
+		return false, nil
+	}
+
+	// Check if expired.
+	if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// Incr increments the integer value of key by 1.
+func (s *MemoryStore) Incr(ctx context.Context, key string) (int64, error) {
+	return s.IncrBy(ctx, key, 1)
+}
+
+// Decr decrements the integer value of key by 1.
+func (s *MemoryStore) Decr(ctx context.Context, key string) (int64, error) {
+	return s.DecrBy(ctx, key, -1)
+}
+
+// IncrBy increments the integer value of key by delta.
+func (s *MemoryStore) IncrBy(_ context.Context, key string, delta int64) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	var currentValue int64
+	e, ok := sh.kv[key]
+
+	if ok {
+		// Check if expired.
+		if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
+			// Treat as non-existent (expired).
+			ok = false
+		} else {
+			// Parse current value as integer.
+			val, err := strconv.ParseInt(string(e.value), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("ERR value is not an integer or out of range")
+			}
+			currentValue = val
+		}
+	}
+
+	// Calculate new value.
+	newValue := currentValue + delta
+	newValueBytes := []byte(strconv.FormatInt(newValue, 10))
+
+	// Calculate memory delta.
+	oldSize := int64(0)
+	if ok {
+		oldSize = entrySize(key, e.value)
+	}
+	newSize := entrySize(key, newValueBytes)
+
+	// Calculate TTL (keep existing TTL or use default).
+	var expireAtMs int64
+	if ok && e.expireAtMs > 0 {
+		expireAtMs = e.expireAtMs
+	} else {
+		expireAtMs = s.now().Add(s.defaultTTL).UnixMilli()
+	}
+
+	// Store new value.
+	sh.kv[key] = entry{
+		value:          newValueBytes,
+		expireAtMs:     expireAtMs,
+		lastAccessedAt: nowSec,
+	}
+
+	// Update memory counter.
+	if ok {
+		atomic.AddInt64(&s.usedMemory, newSize-oldSize)
+	} else {
+		atomic.AddInt64(&s.usedMemory, newSize)
+	}
+
+	return newValue, nil
+}
+
+// DecrBy decrements the integer value of key by delta.
+func (s *MemoryStore) DecrBy(ctx context.Context, key string, delta int64) (int64, error) {
+	return s.IncrBy(ctx, key, -delta)
+}
+
+// MSet sets multiple key-value pairs (all with default TTL).
+func (s *MemoryStore) MSet(ctx context.Context, pairs map[string][]byte) error {
+	for key, value := range pairs {
+		if err := s.Set(ctx, key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MGet retrieves multiple keys.
+func (s *MemoryStore) MGet(ctx context.Context, keys []string) (map[string][]byte, error) {
+	result := make(map[string][]byte, len(keys))
+	for _, key := range keys {
+		value, ok, err := s.Get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			result[key] = value
+		}
+	}
+	return result, nil
+}
+
+// SetNX sets key only if it doesn't exist.
+func (s *MemoryStore) SetNX(ctx context.Context, key string, value []byte) (bool, error) {
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, exists := sh.kv[key]
+	if exists {
+		if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
+			exists = false
+		} else {
+			return false, nil
+		}
+	}
+
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	newSize := entrySize(key, value)
+	sh.kv[key] = entry{
+		value:          value,
+		expireAtMs:     expireAtMs,
+		lastAccessedAt: nowSec,
+		typ:            "string",
+	}
+	atomic.AddInt64(&s.usedMemory, newSize)
+	return true, nil
+}
+
+// SetEX sets key with expiry in seconds.
+func (s *MemoryStore) SetEX(ctx context.Context, key string, value []byte, seconds int64) error {
+	ttl := time.Duration(seconds) * time.Second
+	if ttl > s.maxTTL {
+		ttl = s.maxTTL
+	}
+	return s.SetWithTTL(ctx, key, value, ttl)
+}
+
+// Append appends value to existing key.
+func (s *MemoryStore) Append(ctx context.Context, key string, value []byte) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, exists := sh.kv[key]
+	var newValue []byte
+	var oldSize int64
+
+	if exists && !(e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
+		oldSize = entrySize(key, e.value)
+		newValue = append(e.value, value...)
+	} else {
+		newValue = value
+		exists = false
+	}
+
+	newSize := entrySize(key, newValue)
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	if exists && e.expireAtMs > 0 {
+		expireAtMs = e.expireAtMs
+	}
+
+	sh.kv[key] = entry{
+		value:          newValue,
+		expireAtMs:     expireAtMs,
+		lastAccessedAt: nowSec,
+	}
+
+	if exists {
+		atomic.AddInt64(&s.usedMemory, newSize-oldSize)
+	} else {
+		atomic.AddInt64(&s.usedMemory, newSize)
+	}
+
+	return int64(len(newValue)), nil
+}
+
+// StrLen returns length of string value.
+func (s *MemoryStore) StrLen(ctx context.Context, key string) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
+		return 0, nil
+	}
+	return int64(len(e.value)), nil
+}
+
+// Scan iterates keys matching pattern.
+func (s *MemoryStore) Scan(ctx context.Context, cursor int, pattern string, count int) (int, []string, error) {
+	if count <= 0 {
+		count = 10
+	}
+
+	nowMs := s.now().UnixMilli()
+	var keys []string
+	totalShards := len(s.shards)
+	startShard := cursor % totalShards
+	keysPerShard := count / totalShards
+	if keysPerShard == 0 {
+		keysPerShard = 1
+	}
+
+	for i := 0; i < totalShards && len(keys) < count; i++ {
+		shardIdx := (startShard + i) % totalShards
+		sh := &s.shards[shardIdx]
+
+		sh.mu.RLock()
+		for k, e := range sh.kv {
+			if len(keys) >= count {
+				sh.mu.RUnlock()
+				goto done
+			}
+			if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
+				continue
+			}
+			if pattern == "*" || matchPattern(pattern, k) {
+				keys = append(keys, k)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+
+done:
+	nextCursor := (cursor + totalShards) % (totalShards * 100)
+	if len(keys) < count {
+		nextCursor = 0
+	}
+	return nextCursor, keys, nil
+}
+
+func matchPattern(pattern, key string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == key
+	}
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 2 {
+		prefix, suffix := parts[0], parts[1]
+		return strings.HasPrefix(key, prefix) && strings.HasSuffix(key, suffix)
+	}
+	return false
+}
+
+// HSet sets hash field.
+func (s *MemoryStore) HSet(ctx context.Context, key, field string, value []byte) (bool, error) {
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, exists := sh.kv[key]
+	isNew := false
+	var sizeDelta int64
+	
+	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
+		e = entry{
+			typ:            "hash",
+			hash:           make(map[string][]byte),
+			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
+			lastAccessedAt: nowSec,
+		}
+		exists = false
+		sizeDelta += int64(len(key)) + 48
+	}
+
+	if e.typ != "hash" {
+		return false, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+
+	oldValue, fieldExists := e.hash[field]
+	if !exists {
+		// Case 1: New entry creation (key overhead already added above)
+		sizeDelta += int64(len(field)) + int64(len(value))
+		isNew = true
+	} else if fieldExists {
+		// Case 2: Updating existing field (only value size changes)
+		sizeDelta += int64(len(value)) - int64(len(oldValue))
+	} else {
+		// Case 3: Adding new field to existing entry
+		sizeDelta += int64(len(field)) + int64(len(value))
+		isNew = true
+	}
+	
+	e.hash[field] = value
+	e.lastAccessedAt = nowSec
+	sh.kv[key] = e
+
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
+	return isNew, nil
+}
+
+// HGet gets hash field.
+func (s *MemoryStore) HGet(ctx context.Context, key, field string) ([]byte, bool, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return nil, false, nil
+	}
+
+	val, exists := e.hash[field]
+	if !exists {
+		return nil, false, nil
+	}
+	
+	result := make([]byte, len(val))
+	copy(result, val)
+	return result, true, nil
+}
+
+// HGetAll gets all hash fields.
+func (s *MemoryStore) HGetAll(ctx context.Context, key string) (map[string][]byte, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return make(map[string][]byte), nil
+	}
+
+	result := make(map[string][]byte, len(e.hash))
+	for k, v := range e.hash {
+		valCopy := make([]byte, len(v))
+		copy(valCopy, v)
+		result[k] = valCopy
+	}
+	return result, nil
+}
+
+// HDel deletes hash fields.
+func (s *MemoryStore) HDel(ctx context.Context, key string, fields []string) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, ok := sh.kv[key]
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return 0, nil
+	}
+
+	count := int64(0)
+	var freedMemory int64
+	for _, field := range fields {
+		if value, exists := e.hash[field]; exists {
+			freedMemory += int64(len(field)) + int64(len(value))
+			delete(e.hash, field)
+			count++
+		}
+	}
+
+	if len(e.hash) == 0 {
+		freedMemory += int64(len(key)) + 48
+		delete(sh.kv, key)
+	} else {
+		sh.kv[key] = e
+	}
+	
+	atomic.AddInt64(&s.usedMemory, -freedMemory)
+	return count, nil
+}
+
+// HExists checks if hash field exists.
+func (s *MemoryStore) HExists(ctx context.Context, key, field string) (bool, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return false, nil
+	}
+
+	_, exists := e.hash[field]
+	return exists, nil
+}
+
+// HLen returns hash field count.
+func (s *MemoryStore) HLen(ctx context.Context, key string) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return 0, nil
+	}
+	return int64(len(e.hash)), nil
+}
+
+// HKeys returns all hash field names.
+func (s *MemoryStore) HKeys(ctx context.Context, key string) ([]string, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return []string{}, nil
+	}
+
+	keys := make([]string, 0, len(e.hash))
+	for k := range e.hash {
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+// HVals returns all hash values.
+func (s *MemoryStore) HVals(ctx context.Context, key string) ([][]byte, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "hash" {
+		return [][]byte{}, nil
+	}
+
+	vals := make([][]byte, 0, len(e.hash))
+	for _, v := range e.hash {
+		valCopy := make([]byte, len(v))
+		copy(valCopy, v)
+		vals = append(vals, valCopy)
+	}
+	return vals, nil
+}
+
+// HMSet sets multiple hash fields.
+func (s *MemoryStore) HMSet(ctx context.Context, key string, fields map[string][]byte) error {
+	for field, value := range fields {
+		if _, err := s.HSet(ctx, key, field, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// HMGet gets multiple hash fields.
+func (s *MemoryStore) HMGet(ctx context.Context, key string, fields []string) ([][]byte, error) {
+	result := make([][]byte, len(fields))
+	for i, field := range fields {
+		val, ok, err := s.HGet(ctx, key, field)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			result[i] = val
+		}
+	}
+	return result, nil
+}
+
+// LPush pushes to list head.
+func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, exists := sh.kv[key]
+	var sizeDelta int64
+	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
+		e = entry{
+			typ:            "list",
+			list:           [][]byte{},
+			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
+			lastAccessedAt: nowSec,
+		}
+		sizeDelta += int64(len(key)) + 48
+	}
+
+	if e.typ != "list" {
+		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+
+	for _, value := range values {
+		sizeDelta += int64(len(value))
+	}
+
+	e.list = append(values, e.list...)
+	e.lastAccessedAt = nowSec
+	sh.kv[key] = e
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
+	return int64(len(e.list)), nil
+}
+
+// RPush pushes to list tail.
+func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, exists := sh.kv[key]
+	var sizeDelta int64
+	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
+		e = entry{
+			typ:            "list",
+			list:           [][]byte{},
+			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
+			lastAccessedAt: nowSec,
+		}
+		sizeDelta += int64(len(key)) + 48
+	}
+
+	if e.typ != "list" {
+		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+
+	for _, value := range values {
+		sizeDelta += int64(len(value))
+	}
+
+	e.list = append(e.list, values...)
+	e.lastAccessedAt = nowSec
+	sh.kv[key] = e
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
+	return int64(len(e.list)), nil
+}
+
+// LPop pops from list head.
+func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, ok := sh.kv[key]
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" || len(e.list) == 0 {
+		return nil, false, nil
+	}
+
+	val := e.list[0]
+	sizeDelta := -int64(len(val))
+	e.list = e.list[1:]
+	
+	if len(e.list) == 0 {
+		sizeDelta -= int64(len(key)) + 48
+		delete(sh.kv, key)
+	} else {
+		sh.kv[key] = e
+	}
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
+	
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	return valCopy, true, nil
+}
+
+// RPop pops from list tail.
+func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	e, ok := sh.kv[key]
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" || len(e.list) == 0 {
+		return nil, false, nil
+	}
+
+	val := e.list[len(e.list)-1]
+	sizeDelta := -int64(len(val))
+	e.list = e.list[:len(e.list)-1]
+	
+	if len(e.list) == 0 {
+		sizeDelta -= int64(len(key)) + 48
+		delete(sh.kv, key)
+	} else {
+		sh.kv[key] = e
+	}
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
+	
+	valCopy := make([]byte, len(val))
+	copy(valCopy, val)
+	return valCopy, true, nil
+}
+
+// LLen returns list length.
+func (s *MemoryStore) LLen(ctx context.Context, key string) (int64, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" {
+		return 0, nil
+	}
+	return int64(len(e.list)), nil
+}
+
+// LRange returns list range.
+func (s *MemoryStore) LRange(ctx context.Context, key string, start, stop int64) ([][]byte, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" {
+		return [][]byte{}, nil
+	}
+
+	length := int64(len(e.list))
+	if start < 0 {
+		start = length + start
+	}
+	if stop < 0 {
+		stop = length + stop
+	}
+	if start < 0 {
+		start = 0
+	}
+	if stop >= length {
+		stop = length - 1
+	}
+	if start > stop || start >= length {
+		return [][]byte{}, nil
+	}
+
+	result := make([][]byte, stop-start+1)
+	for i := start; i <= stop; i++ {
+		valCopy := make([]byte, len(e.list[i]))
+		copy(valCopy, e.list[i])
+		result[i-start] = valCopy
+	}
+	return result, nil
+}
+
+// LIndex returns list element at index.
+func (s *MemoryStore) LIndex(ctx context.Context, key string, index int64) ([]byte, bool, error) {
+	nowMs := s.now().UnixMilli()
+	sh := s.shardFor(key)
+
+	sh.mu.RLock()
+	e, ok := sh.kv[key]
+	sh.mu.RUnlock()
+
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" {
+		return nil, false, nil
+	}
+
+	length := int64(len(e.list))
+	if index < 0 {
+		index = length + index
+	}
+	if index < 0 || index >= length {
+		return nil, false, nil
+	}
+
+	valCopy := make([]byte, len(e.list[index]))
+	copy(valCopy, e.list[index])
+	return valCopy, true, nil
 }
 
 // evictIfNeeded runs the eviction loop if usedMemory + newSize would exceed maxMemory.

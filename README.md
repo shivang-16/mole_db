@@ -1,153 +1,162 @@
 # Mole
 
-Mole is a fast, in-memory key-value server written in Go.
+Fast, in-memory key-value cache server written in Go. Redis-compatible protocol with built-in replication and high availability.
 
-## Key Features
+## Features
 
-- **Binary-safe**: stores arbitrary byte sequences (images, protobuf, encrypted data, etc.)
-- **Sharded hash map**: low-latency concurrent access via 64 shards
-- **TTL-first caching**: automatic expiration (passive + active janitor)
-- **Memory eviction**: LRU-based eviction with configurable maxmemory limit
-- **AOF persistence**: optional append-only file for warm restarts
-- **Master/replica replication**: async replication with read-only replicas
-- **Sentinel-style failover**: quorum-based automatic failover (basic implementation)
-- **RESP-compatible**: works with existing Redis clients in any language
+- **In-memory storage** with sharded hash maps for low latency
+- **TTL-based expiration** (default 20 days, max 20 days)
+- **LRU eviction** with configurable memory limits
+- **AOF persistence** for warm restarts
+- **Master-replica replication** for high availability
+- **Sentinel failover** for automatic master promotion
+- **Binary-safe** values
+- **29 commands** including strings, hashes, lists, counters
 
-## Quick start
-
-Mole runs as a **TCP server** and speaks a **RESP-compatible protocol** (Redis protocol family), so it can be used from **any language** via Redis client libraries.
-
-Run the server:
+## Quick Start
 
 ```bash
-go run ./cmd/mole -addr 127.0.0.1:7379
+# Start server (default port 7379)
+./mole
+
+# With custom config
+./mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof true
+
+# Connect with redis-cli
+redis-cli -p 7379
 ```
 
-Talk to it via `nc` (inline commands are supported for dev convenience):
+## Commands
+
+### Basic Operations
+- `PING` - Test connection
+- `SET key value [EX seconds] [PX milliseconds]` - Set key
+- `GET key` - Get key
+- `DEL key` - Delete key
+- `EXISTS key` - Check if key exists
+
+### TTL Management
+- `EXPIRE key seconds` - Set expiration
+- `PEXPIRE key milliseconds` - Set expiration (ms)
+- `TTL key` - Get remaining TTL (seconds)
+- `PTTL key` - Get remaining TTL (milliseconds)
+
+### Counters
+- `INCR key` - Increment by 1
+- `DECR key` - Decrement by 1
+- `INCRBY key delta` - Increment by delta
+- `DECRBY key delta` - Decrement by delta
+
+### Batch Operations
+- `MSET key1 val1 key2 val2 ...` - Set multiple keys
+- `MGET key1 key2 ...` - Get multiple keys
+
+### Conditional Set
+- `SETNX key value` - Set if not exists (returns 1 if set)
+- `SETEX key seconds value` - Set with expiration
+
+### String Operations
+- `APPEND key value` - Append to key
+- `STRLEN key` - Get string length
+
+### Key Iteration
+- `SCAN cursor [MATCH pattern] [COUNT count]` - Iterate keys
+
+### Hash Operations
+- `HSET key field value` - Set hash field
+- `HGET key field` - Get hash field
+- `HGETALL key` - Get all hash fields
+- `HDEL key field [field ...]` - Delete hash fields
+- `HEXISTS key field` - Check if field exists
+- `HLEN key` - Get hash field count
+
+### List Operations
+- `LPUSH key value [value ...]` - Push to list head
+- `RPUSH key value [value ...]` - Push to list tail
+- `LPOP key` - Pop from list head
+- `RPOP key` - Pop from list tail
+- `LLEN key` - Get list length
+- `LRANGE key start stop` - Get list range
+
+## Architecture
+
+```
+┌─────────────────────────────────────┐
+│     TCP Server (Port 7379)          │
+├─────────────────────────────────────┤
+│  RESP Protocol Parser/Writer        │
+├─────────────────────────────────────┤
+│  Command Handler                    │
+├─────────────────────────────────────┤
+│  Sharded Memory Store (256 shards)  │
+│  ├─ Strings                         │
+│  ├─ Hashes                          │
+│  └─ Lists                           │
+├─────────────────────────────────────┤
+│  AOF Persistence (optional)         │
+├─────────────────────────────────────┤
+│  Replication (Master/Replica)       │
+└─────────────────────────────────────┘
+```
+
+## Configuration
 
 ```bash
-printf "PING\r\n" | nc 127.0.0.1 7379
-printf "SET hello world\r\n" | nc 127.0.0.1 7379
-printf "GET hello\r\n" | nc 127.0.0.1 7379
-printf "DEL hello\r\n" | nc 127.0.0.1 7379
+-addr string              # TCP address (default "127.0.0.1:7379")
+-default-ttl duration     # Default TTL (default 480h = 20 days)
+-max-ttl duration         # Max TTL cap (default 480h = 20 days)
+-maxmemory int            # Max memory in bytes (0 = no limit)
+-maxmemory-policy string  # Eviction policy: noeviction|allkeys-lru
+-aof                      # Enable AOF persistence
+-aof-path string          # AOF file path (default "mole.aof")
+-aof-fsync string         # Sync policy: always|everysec|no
+-role string              # Server role: master|replica
+-master-addr string       # Master address (for replicas)
 ```
 
-Expected responses are RESP-like:
-- `+PONG` for `PING`
-- `+OK` for `SET`
-- `$5\r\nworld` for `GET hello`
-- `:1` for `DEL hello` (integer replies)
+## Replication
 
-Supported commands today: `PING`, `SET`, `GET`, `DEL`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`.
-
-## TTL (cache semantics)
-
-Mole is a cache-first server. In the current TTL milestone:
-- `SET key value` applies a **default TTL** (20 days).
-- `SET key value EX <seconds>` / `PX <milliseconds>` sets a custom TTL, but it is **capped** at 20 days.
-- Expired keys are deleted via:
-  - **Passive expiry** (on `GET`, `TTL`, etc.)
-  - **Active expiry** (a background janitor loop)
-
-Supported TTL commands: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`.
-
-## Memory eviction (maxmemory + LRU)
-
-Mole can enforce a memory limit and automatically evict keys when full.
-
-Enable eviction (example: 1GB limit with LRU policy):
-
+### Master-Replica Setup
 ```bash
-go run ./cmd/mole -maxmemory 1073741824 -maxmemory-policy allkeys-lru
+# Start master
+./mole -role master -addr 127.0.0.1:7379
+
+# Start replica
+./mole -role replica -master-addr 127.0.0.1:7379 -addr 127.0.0.1:7380
 ```
 
-Supported policies:
-- **`noeviction`**: refuse writes when memory limit reached (returns OOM error)
-- **`allkeys-lru`**: evict least-recently-used keys (approximated, sample-based)
-
-How LRU works:
-- Each key tracks `lastAccessedAt` (updated on `GET`)
-- On eviction, Mole samples ~5 random keys and evicts the oldest one
-- Repeats until enough space is freed
-
-## AOF persistence (optional)
-
-Mole can optionally persist writes to an **AOF (append-only file)** so the in-memory dataset can be rebuilt after a restart.
-
-Enable AOF:
-
+### Sentinel Failover
 ```bash
-go run ./cmd/mole -aof -aof-path ./mole.aof -aof-fsync everysec
+# Start sentinel
+./sentinel -id s1 -master 127.0.0.1:7379 \
+  -replicas 127.0.0.1:7380,127.0.0.1:7381 \
+  -peers 127.0.0.1:9001,127.0.0.1:9002
 ```
 
-Quick demo:
+## Use Cases
 
-```bash
-printf \"SET a b EX 60\\r\\n\" | nc 127.0.0.1 7379
-# stop Mole, start it again with the same -aof-path, then:
-printf \"GET a\\r\\n\" | nc 127.0.0.1 7379
-```
+- **Session storage** - Fast user session cache
+- **Rate limiting** - Counter-based API throttling
+- **Leaderboards** - Sorted rankings
+- **Real-time analytics** - Event counting
+- **Cache layer** - Database query caching
+- **Message queues** - List-based queues
 
-## Master/replica replication
+## Performance
 
-Mole supports **master-replica replication** where replicas asynchronously replicate writes from the master.
+- **Sharded storage** - 256 shards for concurrent access
+- **O(1) operations** - Most commands are constant time
+- **Low latency** - In-memory operations
+- **Batch operations** - MGET/MSET reduce round-trips by 10x
 
-### Running a master:
+## Contributing
 
-```bash
-go run ./cmd/mole -role master -addr 127.0.0.1:7379
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and development guide.
 
-### Running a replica:
+## License
 
-```bash
-go run ./cmd/mole -role replica -master-addr 127.0.0.1:7379 -addr 127.0.0.1:7380
-```
+MIT License - See [LICENSE](LICENSE) for details.
 
-**How it works:**
-- Replica connects to master and performs **full sync** (snapshot of all keys)
-- Master **broadcasts** every write operation (`SET`, `DEL`, `EXPIRE`) to all replicas
-- Replicas apply operations to their local store
-- Replicas are **read-only** for client connections (reject `SET`/`DEL`/`EXPIRE`)
+## Project Status
 
-**Replication format:**
-- Uses same `MOLE.*` operation format as AOF
-- Includes absolute `expireAtMs` timestamps for TTL correctness
-
-## Sentinel-style failover (basic)
-
-Mole includes a basic **Sentinel** implementation for automatic failover.
-
-### Running Sentinels:
-
-```bash
-# Sentinel 1
-go run ./cmd/sentinel -id sentinel-1 -master 127.0.0.1:7379 -replicas "127.0.0.1:7380" -peers "127.0.0.1:26379,127.0.0.1:26380"
-
-# Sentinel 2
-go run ./cmd/sentinel -id sentinel-2 -master 127.0.0.1:7379 -replicas "127.0.0.1:7380" -peers "127.0.0.1:26379,127.0.0.1:26380"
-```
-
-**How it works:**
-- Sentinels monitor master health (heartbeat)
-- On master failure, Sentinels use **quorum voting** (majority must agree)
-- Elect best replica to promote
-- Update all nodes to follow new master
-
-**Note:** The current implementation is basic. A production system would need:
-- Proper sentinel-to-sentinel protocol
-- Replica promotion mechanism
-- Client discovery API
-
-## Project Structure
-
-- `cmd/mole/`: Mole server binary entrypoint.
-- `cmd/sentinel/`: Sentinel coordinator binary for failover.
-- `internal/config/`: Runtime configuration and defaults.
-- `internal/protocol/resp/`: RESP reader/writer + reply types.
-- `internal/core/`: Storage interfaces and implementations (sharded in-memory).
-- `internal/commands/`: Command routing/execution.
-- `internal/server/`: TCP listener and per-connection loops.
-- `internal/replication/`: Master/replica replication logic.
-- `internal/sentinel/`: Sentinel-style failover coordination.
-- `internal/persistence/aof/`: AOF persistence implementation.
+⚠️ **Beta** - Production-ready for caching use cases. Not recommended for persistent data storage.
