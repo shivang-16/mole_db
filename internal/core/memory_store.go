@@ -599,22 +599,24 @@ func (s *MemoryStore) HSet(ctx context.Context, key, field string, value []byte)
 	}
 
 	oldValue, fieldExists := e.hash[field]
-	if fieldExists {
-		sizeDelta -= int64(len(oldValue))
+	if !exists {
+		// Case 1: New entry creation (key overhead already added above)
+		sizeDelta += int64(len(field)) + int64(len(value))
+		isNew = true
+	} else if fieldExists {
+		// Case 2: Updating existing field (only value size changes)
+		sizeDelta += int64(len(value)) - int64(len(oldValue))
 	} else {
-		sizeDelta += int64(len(field))
+		// Case 3: Adding new field to existing entry
+		sizeDelta += int64(len(field)) + int64(len(value))
+		isNew = true
 	}
-	sizeDelta += int64(len(value))
 	
 	e.hash[field] = value
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
 
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
-
-	if !fieldExists {
-		isNew = true
-	}
 	return isNew, nil
 }
 
