@@ -11,7 +11,7 @@ import (
 // Reader implements a minimal subset of RESP suitable for Mole's command loop.
 //
 // Supported request forms:
-//   - RESP Arrays of Bulk Strings (used by typical Redis clients):
+//   - RESP Arrays of Bulk Strings (used by standard RESP clients):
 //     *<n>\r\n$<len>\r\n<data>\r\n...
 //   - Inline commands (handy for nc during development):
 //     PING\r\n

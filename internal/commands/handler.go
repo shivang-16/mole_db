@@ -226,7 +226,7 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		if !ok {
 			return resp.Integer(-2)
 		}
-		// Redis TTL truncates toward zero seconds.
+		// TTL truncates toward zero seconds.
 		return resp.Integer(int64(ttl / time.Second))
 
 	case "PTTL":

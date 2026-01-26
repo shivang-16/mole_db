@@ -15,7 +15,6 @@ import (
 // It computes the effective TTL using the same policy values used by MemoryStore,
 // then records absolute expireAt timestamps so replay does not extend key lifetimes.
 //
-// Write pattern: write-after (memory first, then AOF), same as Redis.
 // If AOF append fails, the write is already committed to memory.
 // This is acceptable for async replication - AOF failures are logged but don't
 // rollback memory operations (which would be incorrect for async replication).

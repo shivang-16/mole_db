@@ -42,12 +42,12 @@ go test ./...
 # Run with verbose logging
 ./mole -addr 127.0.0.1:7379
 
-# In another terminal, test with redis-cli
-redis-cli -p 7379
-127.0.0.1:7379> SET test hello
-OK
-127.0.0.1:7379> GET test
-"hello"
+# In another terminal, test with mole-cli (or nc)
+echo "SET test hello" | nc 127.0.0.1 7379
++OK
+echo "GET test" | nc 127.0.0.1 7379
+$5
+hello
 ```
 
 ### Testing with netcat
@@ -70,8 +70,9 @@ printf "*2\r\n\$3\r\nGET\r\n\$4\r\nname\r\n" | nc 127.0.0.1 7379
 ./mole -role replica -master-addr 127.0.0.1:7379 -addr 127.0.0.1:7380
 
 # Test replication
-redis-cli -p 7379 SET key value   # Write to master
-redis-cli -p 7380 GET key         # Read from replica
+# Test replication (using nc for example)
+echo "SET key value" | nc 127.0.0.1 7379    # Write to master
+echo "GET key" | nc 127.0.0.1 7380          # Read from replica
 ```
 
 ### Sentinel Failover
@@ -172,7 +173,8 @@ case "MYCOMMAND":
 ```bash
 go build -o mole ./cmd/mole
 ./mole
-redis-cli -p 7379 MYCOMMAND key
+./mole
+echo "MYCOMMAND key" | nc 127.0.0.1 7379
 ```
 
 ## Testing
@@ -195,18 +197,19 @@ go test -cover ./...
 ./mole
 
 # Test in another terminal
-redis-cli -p 7379
-> SET test value
-> GET test
-> HSET user:1 name alice
-> HGETALL user:1
+nc 127.0.0.1 7379
+SET test value
++OK
+GET test
+$5
+value
 ```
 
 ## Common Issues
 
 ### Port already in use
 ```bash
-# Find process using port 7379
+# Find process using port 7379 (default port shared with other RESP services)
 lsof -i :7379
 
 # Kill process
@@ -227,11 +230,9 @@ go mod tidy
 
 ## Performance Testing
 
-### Benchmark with redis-benchmark
-```bash
-# Install redis-benchmark (comes with redis-tools)
-redis-benchmark -p 7379 -t set,get -n 100000 -q
-```
+### Benchmark with standard tools
+# You can use any RESP-compatible benchmark tool
+memtier_benchmark -p 7379 -t 4 -c 50 --ratio=1:10
 
 ## Debugging
 

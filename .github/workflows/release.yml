@@ -1,0 +1,39 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on tags like v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Build Binaries
+        run: |
+          mkdir dist
+          # Mac M1/M2
+          GOOS=darwin GOARCH=arm64 go build -o dist/mole-cli-darwin-arm64 ./cmd/mole-cli
+          # Mac Intel
+          GOOS=darwin GOARCH=amd64 go build -o dist/mole-cli-darwin-amd64 ./cmd/mole-cli
+          # Linux
+          GOOS=linux GOARCH=amd64 go build -o dist/mole-cli-linux-amd64 ./cmd/mole-cli
+          # Windows
+          GOOS=windows GOARCH=amd64 go build -o dist/mole-cli-windows-amd64.exe ./cmd/mole-cli
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          draft: false
+          prerelease: false

@@ -1,0 +1,21 @@
+{
+  "name": "mole-cli",
+  "version": "0.0.1",
+  "description": "The official CLI for Mole DB",
+  "bin": {
+    "mole-cli": "./bin/mole-cli"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shivang-16/mole_db.git"
+  },
+  "author": "Shivang",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "tar": "^6.2.0"
+  }
+}

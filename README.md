@@ -1,6 +1,6 @@
 # Mole
 
-Fast, in-memory key-value cache server written in Go. Redis-compatible protocol with built-in replication and high availability.
+Fast, in-memory key-value cache server written in Go. RESP-compatible protocol with built-in replication and high availability.
 
 ## Features
 
@@ -22,8 +22,8 @@ Fast, in-memory key-value cache server written in Go. Redis-compatible protocol 
 # With custom config
 ./mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof true
 
-# Connect with redis-cli
-redis-cli -p 7379
+# Connect with mole-cli (or any RESP client)
+any-resp-client -p 7379
 ```
 
 ## Commands

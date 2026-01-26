@@ -25,8 +25,6 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		// Use a Redis-adjacent but non-default port to avoid collisions
-		// with a local Redis instance (which commonly uses 6379).
 		Addr:        "127.0.0.1:7379",
 		IdleTimeout: 5 * time.Minute,
 		// Cache policy (initial milestone):
