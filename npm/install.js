@@ -29,7 +29,7 @@ if (!platform || !arch) {
 
 const binaryName = `${BIN_NAME}-${platform}-${arch}${platform === 'windows' ? '.exe' : ''}`;
 const downloadUrl = `https://github.com/${REPO}/releases/download/${VERSION}/${binaryName}`;
-const dest = path.join(__dirname, 'bin', platform === 'windows' ? 'mole-cli.exe' : 'mole-cli');
+const dest = path.join(__dirname, 'bin', platform === 'windows' ? 'mole.exe' : 'mole');
 
 console.log(`Downloading mole-cli ${VERSION} for ${platform}/${arch}...`);
 

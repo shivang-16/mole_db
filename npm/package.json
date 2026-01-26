@@ -1,9 +1,9 @@
 {
-  "name": "mole-db-cli",
+  "name": "moledb",
   "version": "0.0.1",
   "description": "The official CLI for Mole DB",
   "bin": {
-    "mole-cli": "./bin/mole-cli"
+    "mole": "./bin/mole"
   },
   "scripts": {
     "postinstall": "node install.js"
