@@ -469,7 +469,10 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 			return resp.Error("ERR " + err.Error())
 		}
 		if h.master != nil {
-			val, ok, _ := h.store.Get(ctx, key)
+			val, ok, err := h.store.Get(ctx, key)
+			if err != nil {
+				return resp.Error("ERR " + err.Error())
+			}
 			if ok {
 				expireAtMs := time.Now().Add(20 * 24 * time.Hour).UnixMilli()
 				op := aof.RecordSetAt(key, val, expireAtMs)
@@ -507,7 +510,11 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 			if opt == "MATCH" {
 				pattern = string(args[i+1])
 			} else if opt == "COUNT" {
-				count, _ = strconv.Atoi(string(args[i+1]))
+				c, err := strconv.Atoi(string(args[i+1]))
+				if err != nil || c <= 0 {
+					return resp.Error("ERR invalid COUNT value")
+				}
+				count = c
 			}
 		}
 		nextCursor, keys, err := h.store.Scan(ctx, cursor, pattern, count)

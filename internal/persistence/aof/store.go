@@ -212,7 +212,10 @@ func (s *LoggingStore) Append(ctx context.Context, key string, value []byte) (in
 	if err != nil {
 		return 0, err
 	}
-	fullValue, ok, _ := s.underlying.Get(ctx, key)
+	fullValue, ok, err := s.underlying.Get(ctx, key)
+	if err != nil {
+		return newLen, err
+	}
 	if ok {
 		expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
 		_ = s.w.AppendRecord(RecordSetAt(key, fullValue, expireAtMs))
@@ -232,7 +235,12 @@ func (s *LoggingStore) Scan(ctx context.Context, cursor int, pattern string, cou
 
 // HSet sets hash field.
 func (s *LoggingStore) HSet(ctx context.Context, key, field string, value []byte) (bool, error) {
-	return s.underlying.HSet(ctx, key, field, value)
+	isNew, err := s.underlying.HSet(ctx, key, field, value)
+	if err != nil {
+		return false, err
+	}
+	_ = s.w.AppendRecord([][]byte{[]byte("MOLE.HSET"), []byte(key), []byte(field), value})
+	return isNew, nil
 }
 
 func (s *LoggingStore) HGet(ctx context.Context, key, field string) ([]byte, bool, error) {
@@ -244,7 +252,14 @@ func (s *LoggingStore) HGetAll(ctx context.Context, key string) (map[string][]by
 }
 
 func (s *LoggingStore) HDel(ctx context.Context, key string, fields []string) (int64, error) {
-	return s.underlying.HDel(ctx, key, fields)
+	count, err := s.underlying.HDel(ctx, key, fields)
+	if err != nil || count == 0 {
+		return count, err
+	}
+	for _, field := range fields {
+		_ = s.w.AppendRecord([][]byte{[]byte("MOLE.HDEL"), []byte(key), []byte(field)})
+	}
+	return count, nil
 }
 
 func (s *LoggingStore) HExists(ctx context.Context, key, field string) (bool, error) {
@@ -264,7 +279,13 @@ func (s *LoggingStore) HVals(ctx context.Context, key string) ([][]byte, error) 
 }
 
 func (s *LoggingStore) HMSet(ctx context.Context, key string, fields map[string][]byte) error {
-	return s.underlying.HMSet(ctx, key, fields)
+	if err := s.underlying.HMSet(ctx, key, fields); err != nil {
+		return err
+	}
+	for field, value := range fields {
+		_ = s.w.AppendRecord([][]byte{[]byte("MOLE.HSET"), []byte(key), []byte(field), value})
+	}
+	return nil
 }
 
 func (s *LoggingStore) HMGet(ctx context.Context, key string, fields []string) ([][]byte, error) {
@@ -272,19 +293,43 @@ func (s *LoggingStore) HMGet(ctx context.Context, key string, fields []string) (
 }
 
 func (s *LoggingStore) LPush(ctx context.Context, key string, values [][]byte) (int64, error) {
-	return s.underlying.LPush(ctx, key, values)
+	length, err := s.underlying.LPush(ctx, key, values)
+	if err != nil {
+		return 0, err
+	}
+	for _, value := range values {
+		_ = s.w.AppendRecord([][]byte{[]byte("MOLE.LPUSH"), []byte(key), value})
+	}
+	return length, nil
 }
 
 func (s *LoggingStore) RPush(ctx context.Context, key string, values [][]byte) (int64, error) {
-	return s.underlying.RPush(ctx, key, values)
+	length, err := s.underlying.RPush(ctx, key, values)
+	if err != nil {
+		return 0, err
+	}
+	for _, value := range values {
+		_ = s.w.AppendRecord([][]byte{[]byte("MOLE.RPUSH"), []byte(key), value})
+	}
+	return length, nil
 }
 
 func (s *LoggingStore) LPop(ctx context.Context, key string) ([]byte, bool, error) {
-	return s.underlying.LPop(ctx, key)
+	value, ok, err := s.underlying.LPop(ctx, key)
+	if err != nil || !ok {
+		return value, ok, err
+	}
+	_ = s.w.AppendRecord([][]byte{[]byte("MOLE.LPOP"), []byte(key)})
+	return value, ok, nil
 }
 
 func (s *LoggingStore) RPop(ctx context.Context, key string) ([]byte, bool, error) {
-	return s.underlying.RPop(ctx, key)
+	value, ok, err := s.underlying.RPop(ctx, key)
+	if err != nil || !ok {
+		return value, ok, err
+	}
+	_ = s.w.AppendRecord([][]byte{[]byte("MOLE.RPOP"), []byte(key)})
+	return value, ok, nil
 }
 
 func (s *LoggingStore) LLen(ctx context.Context, key string) (int64, error) {
@@ -352,6 +397,48 @@ func ApplyRecordToStore(ctx context.Context, store core.Store, args [][]byte) er
 			return errors.New("mole: bad aof record MOLE.DEL")
 		}
 		_, err := store.Del(ctx, string(args[1]))
+		return err
+
+	case "MOLE.HSET":
+		if len(args) != 4 {
+			return errors.New("mole: bad aof record MOLE.HSET")
+		}
+		_, err := store.HSet(ctx, string(args[1]), string(args[2]), args[3])
+		return err
+
+	case "MOLE.HDEL":
+		if len(args) != 3 {
+			return errors.New("mole: bad aof record MOLE.HDEL")
+		}
+		_, err := store.HDel(ctx, string(args[1]), []string{string(args[2])})
+		return err
+
+	case "MOLE.LPUSH":
+		if len(args) != 3 {
+			return errors.New("mole: bad aof record MOLE.LPUSH")
+		}
+		_, err := store.LPush(ctx, string(args[1]), [][]byte{args[2]})
+		return err
+
+	case "MOLE.RPUSH":
+		if len(args) != 3 {
+			return errors.New("mole: bad aof record MOLE.RPUSH")
+		}
+		_, err := store.RPush(ctx, string(args[1]), [][]byte{args[2]})
+		return err
+
+	case "MOLE.LPOP":
+		if len(args) != 2 {
+			return errors.New("mole: bad aof record MOLE.LPOP")
+		}
+		_, _, err := store.LPop(ctx, string(args[1]))
+		return err
+
+	case "MOLE.RPOP":
+		if len(args) != 2 {
+			return errors.New("mole: bad aof record MOLE.RPOP")
+		}
+		_, _, err := store.RPop(ctx, string(args[1]))
 		return err
 
 	default:

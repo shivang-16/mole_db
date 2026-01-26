@@ -581,6 +581,7 @@ func (s *MemoryStore) HSet(ctx context.Context, key, field string, value []byte)
 
 	e, exists := sh.kv[key]
 	isNew := false
+	var sizeDelta int64
 	
 	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
 		e = entry{
@@ -590,16 +591,26 @@ func (s *MemoryStore) HSet(ctx context.Context, key, field string, value []byte)
 			lastAccessedAt: nowSec,
 		}
 		exists = false
+		sizeDelta += int64(len(key)) + 48
 	}
 
 	if e.typ != "hash" {
 		return false, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	_, fieldExists := e.hash[field]
+	oldValue, fieldExists := e.hash[field]
+	if fieldExists {
+		sizeDelta -= int64(len(oldValue))
+	} else {
+		sizeDelta += int64(len(field))
+	}
+	sizeDelta += int64(len(value))
+	
 	e.hash[field] = value
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
+
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
 
 	if !fieldExists {
 		isNew = true
@@ -666,18 +677,23 @@ func (s *MemoryStore) HDel(ctx context.Context, key string, fields []string) (in
 	}
 
 	count := int64(0)
+	var freedMemory int64
 	for _, field := range fields {
-		if _, exists := e.hash[field]; exists {
+		if value, exists := e.hash[field]; exists {
+			freedMemory += int64(len(field)) + int64(len(value))
 			delete(e.hash, field)
 			count++
 		}
 	}
 
 	if len(e.hash) == 0 {
+		freedMemory += int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
 		sh.kv[key] = e
 	}
+	
+	atomic.AddInt64(&s.usedMemory, -freedMemory)
 	return count, nil
 }
 
@@ -790,6 +806,7 @@ func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (i
 	defer sh.mu.Unlock()
 
 	e, exists := sh.kv[key]
+	var sizeDelta int64
 	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
 		e = entry{
 			typ:            "list",
@@ -797,15 +814,22 @@ func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (i
 			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
 			lastAccessedAt: nowSec,
 		}
+		sizeDelta += int64(len(key)) + 48
 	}
 
 	if e.typ != "list" {
 		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
+	for _, value := range values {
+		sizeDelta += int64(len(value))
+	}
+
 	e.list = append(values, e.list...)
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
 	return int64(len(e.list)), nil
 }
 
@@ -819,6 +843,7 @@ func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (i
 	defer sh.mu.Unlock()
 
 	e, exists := sh.kv[key]
+	var sizeDelta int64
 	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
 		e = entry{
 			typ:            "list",
@@ -826,15 +851,22 @@ func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (i
 			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
 			lastAccessedAt: nowSec,
 		}
+		sizeDelta += int64(len(key)) + 48
 	}
 
 	if e.typ != "list" {
 		return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
+	for _, value := range values {
+		sizeDelta += int64(len(value))
+	}
+
 	e.list = append(e.list, values...)
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
 	return int64(len(e.list)), nil
 }
 
@@ -852,13 +884,17 @@ func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error
 	}
 
 	val := e.list[0]
+	sizeDelta := -int64(len(val))
 	e.list = e.list[1:]
 	
 	if len(e.list) == 0 {
+		sizeDelta -= int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
 		sh.kv[key] = e
 	}
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
 	
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
@@ -879,13 +915,17 @@ func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error
 	}
 
 	val := e.list[len(e.list)-1]
+	sizeDelta := -int64(len(val))
 	e.list = e.list[:len(e.list)-1]
 	
 	if len(e.list) == 0 {
+		sizeDelta -= int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
 		sh.kv[key] = e
 	}
+	
+	atomic.AddInt64(&s.usedMemory, sizeDelta)
 	
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
