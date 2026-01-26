@@ -1,5 +1,5 @@
 {
-  "name": "mole-cli",
+  "name": "mole-db-cli",
   "version": "0.0.1",
   "description": "The official CLI for Mole DB",
   "bin": {
