@@ -118,6 +118,187 @@ func (s *LoggingStore) Del(ctx context.Context, key string) (bool, error) {
 	return deleted, s.w.AppendRecord(RecordDel(key))
 }
 
+// Exists checks if key exists (read-only).
+func (s *LoggingStore) Exists(ctx context.Context, key string) (bool, error) {
+	return s.underlying.Exists(ctx, key)
+}
+
+// Incr increments and logs the operation.
+func (s *LoggingStore) Incr(ctx context.Context, key string) (int64, error) {
+	newValue, err := s.underlying.Incr(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	// Log the final value as MOLE.SET
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	_ = s.w.AppendRecord(RecordSetAt(key, []byte(strconv.FormatInt(newValue, 10)), expireAtMs))
+	return newValue, nil
+}
+
+// Decr decrements and logs the operation.
+func (s *LoggingStore) Decr(ctx context.Context, key string) (int64, error) {
+	newValue, err := s.underlying.Decr(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	_ = s.w.AppendRecord(RecordSetAt(key, []byte(strconv.FormatInt(newValue, 10)), expireAtMs))
+	return newValue, nil
+}
+
+// IncrBy increments by delta and logs the operation.
+func (s *LoggingStore) IncrBy(ctx context.Context, key string, delta int64) (int64, error) {
+	newValue, err := s.underlying.IncrBy(ctx, key, delta)
+	if err != nil {
+		return 0, err
+	}
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	_ = s.w.AppendRecord(RecordSetAt(key, []byte(strconv.FormatInt(newValue, 10)), expireAtMs))
+	return newValue, nil
+}
+
+// DecrBy decrements by delta and logs the operation.
+func (s *LoggingStore) DecrBy(ctx context.Context, key string, delta int64) (int64, error) {
+	newValue, err := s.underlying.DecrBy(ctx, key, delta)
+	if err != nil {
+		return 0, err
+	}
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	_ = s.w.AppendRecord(RecordSetAt(key, []byte(strconv.FormatInt(newValue, 10)), expireAtMs))
+	return newValue, nil
+}
+
+// MSet sets multiple keys and logs each operation.
+func (s *LoggingStore) MSet(ctx context.Context, pairs map[string][]byte) error {
+	if err := s.underlying.MSet(ctx, pairs); err != nil {
+		return err
+	}
+	// Log each key-value pair
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	for key, value := range pairs {
+		_ = s.w.AppendRecord(RecordSetAt(key, value, expireAtMs))
+	}
+	return nil
+}
+
+// MGet retrieves multiple keys (read-only).
+func (s *LoggingStore) MGet(ctx context.Context, keys []string) (map[string][]byte, error) {
+	return s.underlying.MGet(ctx, keys)
+}
+
+// SetNX sets if not exists.
+func (s *LoggingStore) SetNX(ctx context.Context, key string, value []byte) (bool, error) {
+	set, err := s.underlying.SetNX(ctx, key, value)
+	if err != nil || !set {
+		return set, err
+	}
+	expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+	_ = s.w.AppendRecord(RecordSetAt(key, value, expireAtMs))
+	return true, nil
+}
+
+// SetEX sets with expiry.
+func (s *LoggingStore) SetEX(ctx context.Context, key string, value []byte, seconds int64) error {
+	if err := s.underlying.SetEX(ctx, key, value, seconds); err != nil {
+		return err
+	}
+	expireAtMs := s.now().Add(time.Duration(seconds) * time.Second).UnixMilli()
+	return s.w.AppendRecord(RecordSetAt(key, value, expireAtMs))
+}
+
+// Append appends to key.
+func (s *LoggingStore) Append(ctx context.Context, key string, value []byte) (int64, error) {
+	newLen, err := s.underlying.Append(ctx, key, value)
+	if err != nil {
+		return 0, err
+	}
+	fullValue, ok, _ := s.underlying.Get(ctx, key)
+	if ok {
+		expireAtMs := s.now().Add(s.defaultTTL).UnixMilli()
+		_ = s.w.AppendRecord(RecordSetAt(key, fullValue, expireAtMs))
+	}
+	return newLen, nil
+}
+
+// StrLen returns string length (read-only).
+func (s *LoggingStore) StrLen(ctx context.Context, key string) (int64, error) {
+	return s.underlying.StrLen(ctx, key)
+}
+
+// Scan iterates keys (read-only).
+func (s *LoggingStore) Scan(ctx context.Context, cursor int, pattern string, count int) (int, []string, error) {
+	return s.underlying.Scan(ctx, cursor, pattern, count)
+}
+
+// HSet sets hash field.
+func (s *LoggingStore) HSet(ctx context.Context, key, field string, value []byte) (bool, error) {
+	return s.underlying.HSet(ctx, key, field, value)
+}
+
+func (s *LoggingStore) HGet(ctx context.Context, key, field string) ([]byte, bool, error) {
+	return s.underlying.HGet(ctx, key, field)
+}
+
+func (s *LoggingStore) HGetAll(ctx context.Context, key string) (map[string][]byte, error) {
+	return s.underlying.HGetAll(ctx, key)
+}
+
+func (s *LoggingStore) HDel(ctx context.Context, key string, fields []string) (int64, error) {
+	return s.underlying.HDel(ctx, key, fields)
+}
+
+func (s *LoggingStore) HExists(ctx context.Context, key, field string) (bool, error) {
+	return s.underlying.HExists(ctx, key, field)
+}
+
+func (s *LoggingStore) HLen(ctx context.Context, key string) (int64, error) {
+	return s.underlying.HLen(ctx, key)
+}
+
+func (s *LoggingStore) HKeys(ctx context.Context, key string) ([]string, error) {
+	return s.underlying.HKeys(ctx, key)
+}
+
+func (s *LoggingStore) HVals(ctx context.Context, key string) ([][]byte, error) {
+	return s.underlying.HVals(ctx, key)
+}
+
+func (s *LoggingStore) HMSet(ctx context.Context, key string, fields map[string][]byte) error {
+	return s.underlying.HMSet(ctx, key, fields)
+}
+
+func (s *LoggingStore) HMGet(ctx context.Context, key string, fields []string) ([][]byte, error) {
+	return s.underlying.HMGet(ctx, key, fields)
+}
+
+func (s *LoggingStore) LPush(ctx context.Context, key string, values [][]byte) (int64, error) {
+	return s.underlying.LPush(ctx, key, values)
+}
+
+func (s *LoggingStore) RPush(ctx context.Context, key string, values [][]byte) (int64, error) {
+	return s.underlying.RPush(ctx, key, values)
+}
+
+func (s *LoggingStore) LPop(ctx context.Context, key string) ([]byte, bool, error) {
+	return s.underlying.LPop(ctx, key)
+}
+
+func (s *LoggingStore) RPop(ctx context.Context, key string) ([]byte, bool, error) {
+	return s.underlying.RPop(ctx, key)
+}
+
+func (s *LoggingStore) LLen(ctx context.Context, key string) (int64, error) {
+	return s.underlying.LLen(ctx, key)
+}
+
+func (s *LoggingStore) LRange(ctx context.Context, key string, start, stop int64) ([][]byte, error) {
+	return s.underlying.LRange(ctx, key, start, stop)
+}
+
+func (s *LoggingStore) LIndex(ctx context.Context, key string, index int64) ([]byte, bool, error) {
+	return s.underlying.LIndex(ctx, key, index)
+}
+
 func normalizeTTL(ttl, defaultTTL, maxTTL time.Duration) time.Duration {
 	if ttl <= 0 {
 		ttl = defaultTTL
