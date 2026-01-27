@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"net"
@@ -22,7 +24,7 @@ import (
 
 func main() {
 	cfg := config.Default()
-	interactive := flag.Bool("i", false, "start server and enter interactive mode")
+	daemon := flag.Bool("d", false, "run server in daemon mode (no interactive shell)")
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "TCP address to listen on")
 	flag.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "idle timeout for client connections")
 	flag.DurationVar(&cfg.DefaultTTL, "default-ttl", cfg.DefaultTTL, "default TTL applied to SET without EX/PX")
@@ -37,11 +39,15 @@ func main() {
 	flag.StringVar(&cfg.MasterAddr, "master-addr", cfg.MasterAddr, "master address (required for replica)")
 	flag.Parse()
 
-	if *interactive {
-		runInteractive(&cfg)
+	if *daemon {
+		runDaemon(&cfg)
 		return
 	}
 
+	runInteractive(&cfg)
+}
+
+func runDaemon(cfg *config.Config) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -213,7 +219,16 @@ func runInteractive(cfg *config.Config) {
 	}
 	defer conn.Close()
 
-	fmt.Printf("mole-cli connected to %s\n", cfg.Addr)
+	fmt.Println()
+	fmt.Println("Current Mole Log ID:", generateLogID())
+	fmt.Printf("Connecting to:       \x1b[32mmole://%s\x1b[0m\n", cfg.Addr)
+	fmt.Println("Using Mole DB:       0.1.3")
+	fmt.Println()
+	fmt.Println("------")
+	fmt.Println("   For Mole DB documentation see: https://github.com/shivang-16/mole_db")
+	fmt.Println("------")
+	fmt.Println()
+
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Printf("%s> ", cfg.Addr)
@@ -299,4 +314,10 @@ func readResponse(conn net.Conn) {
 	default:
 		fmt.Printf("Unknown response type: %s\n", line)
 	}
+}
+
+func generateLogID() string {
+	b := make([]byte, 12)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
