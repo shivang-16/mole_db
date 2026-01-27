@@ -1,19 +1,16 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { execSync } = require('child_process');
 
-// Configuration
-const VERSION = 'v0.0.1'; // Update this to match the tag you want to download
+const VERSION = require('./package.json').version;
 const REPO = 'shivang-16/mole_db';
-const BIN_NAME = 'mole-cli';
 
-// Detect OS and Arch
 const osMap = {
     'darwin': 'darwin',
     'linux': 'linux',
     'win32': 'windows'
 };
+
 const archMap = {
     'x64': 'amd64',
     'arm64': 'arm64'
@@ -27,47 +24,74 @@ if (!platform || !arch) {
     process.exit(1);
 }
 
-const binaryName = `${BIN_NAME}-${platform}-${arch}${platform === 'windows' ? '.exe' : ''}`;
-const downloadUrl = `https://github.com/${REPO}/releases/download/${VERSION}/${binaryName}`;
-const dest = path.join(__dirname, 'bin', platform === 'windows' ? 'mole.exe' : 'mole');
-
-console.log(`Downloading mole-cli ${VERSION} for ${platform}/${arch}...`);
-
-if (!fs.existsSync(path.join(__dirname, 'bin'))) {
-    fs.mkdirSync(path.join(__dirname, 'bin'));
+const binDir = path.join(__dirname, 'bin');
+if (!fs.existsSync(binDir)) {
+    fs.mkdirSync(binDir, { recursive: true });
 }
 
-const file = fs.createWriteStream(dest);
+const isWindows = platform === 'windows';
+const ext = isWindows ? '.exe' : '';
 
-https.get(downloadUrl, (response) => {
-    if (response.statusCode === 302) {
-        // Handle redirect
-        https.get(response.headers.location, (response) => {
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                if (platform !== 'windows') {
-                    fs.chmodSync(dest, 0o755); // Make executable
-                }
-                console.log('Download complete!');
-            });
+const binaries = [
+    { name: 'mole', remote: `mole-${platform}-${arch}${ext}` },
+    { name: 'mole-cli', remote: `mole-cli-${platform}-${arch}${ext}` }
+];
+
+console.log(`Installing Mole DB v${VERSION} for ${platform}/${arch}...`);
+
+function downloadBinary(binaryInfo) {
+    return new Promise((resolve, reject) => {
+        const downloadUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/${binaryInfo.remote}`;
+        const dest = path.join(binDir, `${binaryInfo.name}${ext}`);
+
+        console.log(`Downloading ${binaryInfo.name}...`);
+
+        const file = fs.createWriteStream(dest);
+        
+        https.get(downloadUrl, (response) => {
+            if (response.statusCode === 302 || response.statusCode === 301) {
+                https.get(response.headers.location, (response) => {
+                    response.pipe(file);
+                    file.on('finish', () => {
+                        file.close();
+                        if (!isWindows) {
+                            fs.chmodSync(dest, 0o755);
+                        }
+                        console.log(`✓ ${binaryInfo.name} installed`);
+                        resolve();
+                    });
+                }).on('error', reject);
+            } else if (response.statusCode !== 200) {
+                fs.unlink(dest, () => {});
+                reject(new Error(`Failed to download ${binaryInfo.name}: HTTP ${response.statusCode}`));
+            } else {
+                response.pipe(file);
+                file.on('finish', () => {
+                    file.close();
+                    if (!isWindows) {
+                        fs.chmodSync(dest, 0o755);
+                    }
+                    console.log(`✓ ${binaryInfo.name} installed`);
+                    resolve();
+                });
+            }
+        }).on('error', (err) => {
+            fs.unlink(dest, () => {});
+            reject(err);
         });
-    } else if (response.statusCode !== 200) {
-        console.error(`Failed to download binary: HTTP ${response.statusCode}`);
-        console.error(downloadUrl);
+    });
+}
+
+Promise.all(binaries.map(downloadBinary))
+    .then(() => {
+        console.log('\n✨ Mole DB installed successfully!');
+        console.log('\nUsage:');
+        console.log('  mole              # Start the server');
+        console.log('  mole-cli          # Connect to the server');
+    })
+    .catch((err) => {
+        console.error(`\nInstallation failed: ${err.message}`);
+        console.error(`\nPlease try installing manually from:`);
+        console.error(`https://github.com/${REPO}/releases/tag/v${VERSION}`);
         process.exit(1);
-    } else {
-        response.pipe(file);
-        file.on('finish', () => {
-             file.close();
-             if (platform !== 'windows') {
-                 fs.chmodSync(dest, 0o755);
-             }
-             console.log('Download complete!');
-        });
-    }
-}).on('error', (err) => {
-    fs.unlink(dest, () => {});
-    console.error(`Error downloading file: ${err.message}`);
-    process.exit(1);
-});
+    });

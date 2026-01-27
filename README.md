@@ -13,17 +13,43 @@ Fast, in-memory key-value cache server written in Go. RESP-compatible protocol w
 - **Binary-safe** values
 - **29 commands** including strings, hashes, lists, counters
 
+## Installation
+
+### Via npm (Recommended)
+
+```bash
+npm install -g moledb
+```
+
+This installs pre-compiled binaries for your platform (macOS, Linux, Windows).
+
+### From source
+
+```bash
+git clone https://github.com/shivang-16/mole_db.git
+cd mole_db
+go build -o mole ./cmd/mole
+go build -o mole-cli ./cmd/mole-cli
+```
+
 ## Quick Start
 
 ```bash
 # Start server (default port 7379)
-./mole
+mole
 
-# With custom config
-./mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof true
+# Connect with CLI
+mole-cli
+127.0.0.1:7379> SET mykey "Hello World"
+OK
+127.0.0.1:7379> GET mykey
+"Hello World"
+```
 
-# Connect with mole-cli (or any RESP client)
-any-resp-client -p 7379
+### With custom config
+
+```bash
+mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 ```
 
 ## Commands

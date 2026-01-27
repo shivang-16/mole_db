@@ -1,0 +1,24 @@
+# Exclude Go source files
+*.go
+go.mod
+go.sum
+
+# Exclude internal directories
+internal/
+cmd/
+
+# Exclude build artifacts
+dist/
+*.exe
+*.o
+*.a
+
+# Exclude development files
+.git/
+.github/
+.gitignore
+Dockerfile
+CONTRIBUTING.md
+
+# Keep only npm-related files
+!npm/

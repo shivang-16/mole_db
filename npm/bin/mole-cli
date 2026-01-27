@@ -1,5 +1,5 @@
 #!/bin/sh
 # This is a placeholder. The actual binary will be downloaded during npm install.
-echo "Error: mole binary not found. Please reinstall the package:"
+echo "Error: mole-cli binary not found. Please reinstall the package:"
 echo "  npm install -g moledb"
 exit 1
