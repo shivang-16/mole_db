@@ -1,6 +1,6 @@
 {
   "name": "moledb",
-  "version": "0.1.5",
+  "version": "0.1.6",
 
 
   "description": "Fast, lightweight in-memory database. Redis-compatible protocol with persistence, replication, and Sentinel support.",
