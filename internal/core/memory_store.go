@@ -161,9 +161,10 @@ func (s *MemoryStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
 
-	// Return value directly without copy for better performance.
-	// Callers MUST NOT mutate the returned slice.
-	val := e.value
+	// Return copy to prevent callers from mutating internal state.
+	valCopy := make([]byte, len(e.value))
+	copy(valCopy, e.value)
+	val := valCopy
 	sh.mu.Unlock()
 
 	return val, true, nil
@@ -1019,6 +1020,7 @@ func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error
 		e.listHead = e.listHead[1:]
 	} else if len(e.listTail) > 0 {
 		// If head is empty, move tail to head (reverse it)
+		e.listHead = make([][]byte, 0, len(e.listTail))
 		for i := len(e.listTail) - 1; i >= 0; i-- {
 			e.listHead = append(e.listHead, e.listTail[i])
 		}
@@ -1066,6 +1068,7 @@ func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error
 		e.listTail = e.listTail[:len(e.listTail)-1]
 	} else if len(e.listHead) > 0 {
 		// If tail is empty, move head to tail (reverse it)
+		e.listTail = make([][]byte, 0, len(e.listHead))
 		for i := len(e.listHead) - 1; i >= 0; i-- {
 			e.listTail = append(e.listTail, e.listHead[i])
 		}
