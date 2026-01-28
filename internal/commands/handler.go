@@ -10,18 +10,28 @@ import (
 	"mole/internal/core"
 	"mole/internal/persistence/aof"
 	"mole/internal/protocol/resp"
+	"mole/internal/pubsub"
 	"mole/internal/replication"
 )
 
 type Handler struct {
-	store    core.Store
-	mu       sync.RWMutex // protects readOnly and master fields
-	readOnly bool
-	master   *replication.Master // nil if not master
+	store     core.Store
+	mu        sync.RWMutex // protects readOnly and master fields
+	readOnly  bool
+	master    *replication.Master // nil if not master
+	pubsubMgr *pubsub.Manager
 }
 
 func NewHandler(store core.Store) *Handler {
-	return &Handler{store: store}
+	return &Handler{
+		store:     store,
+		pubsubMgr: pubsub.NewManager(),
+	}
+}
+
+// GetPubSubManager returns the pub/sub manager.
+func (h *Handler) GetPubSubManager() *pubsub.Manager {
+	return h.pubsubMgr
 }
 
 // SetReadOnly marks the handler as read-only (for replicas).
@@ -730,6 +740,57 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 			result[i] = resp.BulkString(v)
 		}
 		return resp.Array(result)
+
+	case "PUB", "MOLE.PUB":
+		if len(args) != 3 {
+			return resp.Error("ERR wrong number of arguments for 'PUB'")
+		}
+		channel := string(args[1])
+		message := args[2]
+		count := h.pubsubMgr.Publish(ctx, channel, message)
+		return resp.Integer(count)
+
+	case "PUBSUB", "MOLE.PUBSUB":
+		if len(args) < 2 {
+			return resp.Error("ERR wrong number of arguments for 'PUBSUB'")
+		}
+		subCmd := strings.ToUpper(string(args[1]))
+		switch subCmd {
+		case "CHANNELS":
+			pattern := "*"
+			if len(args) >= 3 {
+				pattern = string(args[2])
+			}
+			channels := h.pubsubMgr.GetChannels(pattern)
+			result := make([]resp.Reply, len(channels))
+			for i, ch := range channels {
+				result[i] = resp.BulkString([]byte(ch))
+			}
+			return resp.Array(result)
+
+		case "NUMSUB":
+			if len(args) < 3 {
+				return resp.Array([]resp.Reply{})
+			}
+			channels := make([]string, len(args)-2)
+			for i := 2; i < len(args); i++ {
+				channels[i-2] = string(args[i])
+			}
+			counts := h.pubsubMgr.GetNumSub(channels...)
+			result := make([]resp.Reply, 0, len(channels)*2)
+			for _, ch := range channels {
+				result = append(result, resp.BulkString([]byte(ch)))
+				result = append(result, resp.Integer(counts[ch]))
+			}
+			return resp.Array(result)
+
+		case "NUMPAT":
+			count := h.pubsubMgr.GetNumPat()
+			return resp.Integer(count)
+
+		default:
+			return resp.Error("ERR unknown PUBSUB subcommand '" + subCmd + "'")
+		}
 
 	default:
 		return resp.Error("ERR unknown command '" + cmd + "'")
