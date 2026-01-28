@@ -109,7 +109,7 @@ Promise.all(binaries.map(downloadBinary))
         console.log('Usage:');
         console.log('  mole                  # Start interactive mode (server + client)');
         console.log('  mole server -d        # Start server daemon');
-        console.log('  mole cli              # Connect to running server');
+        console.log('  mole connect          # Connect to running server');
         console.log('  mole help             # Show help\n');
     })
     .catch((err) => {

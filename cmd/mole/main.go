@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -46,23 +47,25 @@ func main() {
 
 func runServerCommand() {
 	cfg := config.Default()
-	daemon := flag.Bool("d", false, "run server in daemon mode")
-	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "TCP address to listen on")
-	flag.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "idle timeout for client connections")
-	flag.DurationVar(&cfg.DefaultTTL, "default-ttl", cfg.DefaultTTL, "default TTL applied to SET without EX/PX")
-	flag.DurationVar(&cfg.MaxTTL, "max-ttl", cfg.MaxTTL, "hard cap for any TTL (EX/PX/EXPIRE)")
-	flag.DurationVar(&cfg.JanitorInterval, "janitor-interval", cfg.JanitorInterval, "how often to actively delete expired keys")
-	flag.BoolVar(&cfg.AOFEnabled, "aof", cfg.AOFEnabled, "enable AOF persistence")
-	flag.StringVar(&cfg.AOFPath, "aof-path", cfg.AOFPath, "AOF file path")
-	flag.StringVar(&cfg.AOFSyncPolicy, "aof-fsync", cfg.AOFSyncPolicy, "AOF fsync policy: always|everysec|no")
-	flag.Int64Var(&cfg.MaxMemory, "maxmemory", cfg.MaxMemory, "max memory in bytes (0 = no limit)")
-	flag.StringVar(&cfg.MaxMemoryPolicy, "maxmemory-policy", cfg.MaxMemoryPolicy, "eviction policy: noeviction|allkeys-lru")
-	flag.StringVar(&cfg.Role, "role", cfg.Role, "server role: master|replica")
-	flag.StringVar(&cfg.MasterAddr, "master-addr", cfg.MasterAddr, "master address (required for replica)")
 
-	// Skip "server" argument for flag parsing
-	os.Args = os.Args[1:]
-	flag.Parse()
+	// Create dedicated flag set for server subcommand
+	serverFlags := flag.NewFlagSet("server", flag.ExitOnError)
+	daemon := serverFlags.Bool("d", false, "run server in daemon mode")
+	serverFlags.StringVar(&cfg.Addr, "addr", cfg.Addr, "TCP address to listen on")
+	serverFlags.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "idle timeout for client connections")
+	serverFlags.DurationVar(&cfg.DefaultTTL, "default-ttl", cfg.DefaultTTL, "default TTL applied to SET without EX/PX")
+	serverFlags.DurationVar(&cfg.MaxTTL, "max-ttl", cfg.MaxTTL, "hard cap for any TTL (EX/PX/EXPIRE)")
+	serverFlags.DurationVar(&cfg.JanitorInterval, "janitor-interval", cfg.JanitorInterval, "how often to actively delete expired keys")
+	serverFlags.BoolVar(&cfg.AOFEnabled, "aof", cfg.AOFEnabled, "enable AOF persistence")
+	serverFlags.StringVar(&cfg.AOFPath, "aof-path", cfg.AOFPath, "AOF file path")
+	serverFlags.StringVar(&cfg.AOFSyncPolicy, "aof-fsync", cfg.AOFSyncPolicy, "AOF fsync policy: always|everysec|no")
+	serverFlags.Int64Var(&cfg.MaxMemory, "maxmemory", cfg.MaxMemory, "max memory in bytes (0 = no limit)")
+	serverFlags.StringVar(&cfg.MaxMemoryPolicy, "maxmemory-policy", cfg.MaxMemoryPolicy, "eviction policy: noeviction|allkeys-lru")
+	serverFlags.StringVar(&cfg.Role, "role", cfg.Role, "server role: master|replica")
+	serverFlags.StringVar(&cfg.MasterAddr, "master-addr", cfg.MasterAddr, "master address (required for replica)")
+
+	// Parse from os.Args[2:] to skip program name and "server"
+	serverFlags.Parse(os.Args[2:])
 
 	if *daemon {
 		runDaemon(&cfg)
@@ -74,12 +77,13 @@ func runServerCommand() {
 }
 
 func runConnectCommand() {
-	host := flag.String("h", "127.0.0.1", "Mole DB Server Host")
-	port := flag.Int("p", 7379, "Mole DB Server Port")
+	// Create dedicated flag set for connect subcommand
+	connectFlags := flag.NewFlagSet("connect", flag.ExitOnError)
+	host := connectFlags.String("h", "127.0.0.1", "Mole DB Server Host")
+	port := connectFlags.Int("p", 7379, "Mole DB Server Port")
 
-	// Skip "connect" argument for flag parsing
-	os.Args = os.Args[1:]
-	flag.Parse()
+	// Parse from os.Args[2:] to skip program name and "connect"
+	connectFlags.Parse(os.Args[2:])
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 
@@ -97,8 +101,8 @@ func runConnectCommand() {
 
 	// Server exists, connect as client
 	// If args provided (non-interactive mode)
-	if len(flag.Args()) > 0 {
-		runSingleCommand(addr, flag.Args())
+	if len(connectFlags.Args()) > 0 {
+		runSingleCommand(addr, connectFlags.Args())
 		return
 	}
 
@@ -580,7 +584,7 @@ func readResponse(conn net.Conn) {
 			return
 		}
 		data := make([]byte, length+2)
-		_, err := reader.Read(data)
+		_, err := io.ReadFull(reader, data)
 		if err != nil {
 			fmt.Printf("Error reading bulk string: %v\n", err)
 			return
@@ -634,7 +638,7 @@ func handleSubscriptionMode(conn net.Conn) {
 		// Read elements
 		elements := make([]string, count)
 		for i := 0; i < count; i++ {
-			elem, err := readBulkString(reader)
+			elem, err := readRESPElement(reader)
 			if err != nil {
 				fmt.Printf("Error reading element: %v\n", err)
 				return
@@ -689,6 +693,50 @@ func handleSubscriptionMode(conn net.Conn) {
 	}
 }
 
+// readRESPElement reads any RESP element (bulk string, integer, simple string, etc.)
+func readRESPElement(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+
+	line = strings.TrimSuffix(line, "\r\n")
+	if len(line) == 0 {
+		return "", fmt.Errorf("empty RESP line")
+	}
+
+	switch line[0] {
+	case '$': // Bulk string
+		var length int
+		fmt.Sscanf(line[1:], "%d", &length)
+
+		if length == -1 {
+			return "(nil)", nil
+		}
+
+		// Read exact bytes + CRLF
+		data := make([]byte, length+2)
+		_, err = io.ReadFull(reader, data)
+		if err != nil {
+			return "", err
+		}
+
+		return string(data[:length]), nil
+
+	case ':': // Integer
+		return line[1:], nil
+
+	case '+': // Simple string
+		return line[1:], nil
+
+	case '-': // Error
+		return line[1:], nil
+
+	default:
+		return "", fmt.Errorf("unknown RESP type: %c", line[0])
+	}
+}
+
 // readBulkString reads a RESP bulk string from the reader.
 func readBulkString(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
@@ -710,7 +758,7 @@ func readBulkString(reader *bufio.Reader) (string, error) {
 
 	// Read exact bytes + CRLF
 	data := make([]byte, length+2)
-	_, err = reader.Read(data)
+	_, err = io.ReadFull(reader, data)
 	if err != nil {
 		return "", err
 	}

@@ -12,7 +12,6 @@ type Manager struct {
 	channels    map[string]*channel      // channel name -> subscribers
 	patterns    map[string]*patternSub   // pattern -> subscribers
 	subscribers map[*Subscriber]struct{} // all active subscribers
-	msgPool     sync.Pool                // message buffer pool
 	totalMsgs   int64                    // stats: total messages published
 	totalSubs   int64                    // stats: total active subscriptions
 }
@@ -39,11 +38,6 @@ func NewManager() *Manager {
 		channels:    make(map[string]*channel),
 		patterns:    make(map[string]*patternSub),
 		subscribers: make(map[*Subscriber]struct{}),
-		msgPool: sync.Pool{
-			New: func() interface{} {
-				return &Message{}
-			},
-		},
 	}
 }
 
@@ -178,29 +172,25 @@ func (m *Manager) PUnsubscribe(sub *Subscriber, patterns ...string) []string {
 func (m *Manager) Publish(ctx context.Context, channel string, payload []byte) int64 {
 	m.mu.RLock()
 
-	// Collect channel subscribers
+	// Collect channel subscribers  
 	var subs []*Subscriber
+	subsMap := make(map[*Subscriber]struct{}) // For O(1) duplicate detection
+	
 	if ch, ok := m.channels[channel]; ok {
 		subs = make([]*Subscriber, 0, len(ch.subscribers))
 		for sub := range ch.subscribers {
 			subs = append(subs, sub)
+			subsMap[sub] = struct{}{}
 		}
 	}
 
-	// Collect pattern subscribers
+	// Collect pattern subscribers (avoiding duplicates with map lookup)
 	for patName, pat := range m.patterns {
 		if matchPattern(patName, channel) {
 			for sub := range pat.subscribers {
-				// Avoid duplicates
-				alreadyAdded := false
-				for _, s := range subs {
-					if s == sub {
-						alreadyAdded = true
-						break
-					}
-				}
-				if !alreadyAdded {
+				if _, exists := subsMap[sub]; !exists {
 					subs = append(subs, sub)
+					subsMap[sub] = struct{}{}
 				}
 			}
 		}
@@ -213,10 +203,12 @@ func (m *Manager) Publish(ctx context.Context, channel string, payload []byte) i
 	}
 
 	// Create message (reuse from pool)
-	msg := m.msgPool.Get().(*Message)
-	msg.Channel = channel
-	msg.Payload = payload
-	msg.Pattern = ""
+	// Create message directly (no pooling for safety)
+	msg := &Message{
+		Channel: channel,
+		Payload: payload,
+		Pattern: "",
+	}
 
 	// Broadcast to all subscribers (non-blocking)
 	count := int64(0)
@@ -227,12 +219,6 @@ func (m *Manager) Publish(ctx context.Context, channel string, payload []byte) i
 	}
 
 	atomic.AddInt64(&m.totalMsgs, 1)
-
-	// Return message to pool after a delay (subscribers need time to read it)
-	go func() {
-		<-ctx.Done()
-		m.msgPool.Put(msg)
-	}()
 
 	return count
 }
