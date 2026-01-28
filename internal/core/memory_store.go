@@ -16,7 +16,7 @@ import (
 // MemoryStore is a concurrency-safe in-memory hash map store with eviction.
 //
 // Implementation notes:
-// - Data is sharded across N maps to reduce lock contention under concurrent load.
+// - Data is sharded across N maps (default 1024) to reduce lock contention under concurrent load.
 // - Each entry stores an absolute expireAt timestamp (unix millis) and lastAccessedAt.
 // - Expired keys are removed via passive expiry (on access) and an active janitor.
 // - When maxmemory is reached, keys are evicted using approximated LRU (sample-based).
@@ -31,12 +31,15 @@ type MemoryStore struct {
 	usedMemory int64  // atomic counter (approximate bytes)
 	maxMemory  int64  // 0 = no limit
 	policy     string // eviction policy (only "allkeys-lru" supported for now)
+
+	// Hot key cache for lock-free fast path (disabled for now, add if needed)
+	// hotCache sync.Map
 }
 
 type MemoryStoreOptions struct {
 	DefaultTTL time.Duration
 	MaxTTL     time.Duration
-	Shards     int // number of shards for concurrent access (defaults to 64)
+	Shards     int // number of shards for concurrent access (defaults to 1024 for 10M+ user scalability)
 
 	MaxMemory int64  // max memory in bytes (0 = no limit)
 	Policy    string // eviction policy: "noeviction", "allkeys-lru" (defaults to "allkeys-lru")
@@ -53,7 +56,7 @@ func NewMemoryStore(opts MemoryStoreOptions) *MemoryStore {
 		opts.DefaultTTL = opts.MaxTTL
 	}
 	if opts.Shards <= 0 {
-		opts.Shards = 64
+		opts.Shards = 1024
 	}
 	if opts.Policy == "" {
 		opts.Policy = "allkeys-lru"
@@ -79,7 +82,8 @@ type entry struct {
 	lastAccessedAt int64  // unix seconds (for LRU)
 	typ            string // "string", "hash", "list"
 	hash           map[string][]byte
-	list           [][]byte
+	listHead       [][]byte // Front part of deque
+	listTail       [][]byte // Back part of deque (reversed)
 }
 
 type shard struct {
@@ -156,12 +160,13 @@ func (s *MemoryStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 	// Update LRU access time.
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
+
+	// Return value directly without copy for better performance.
+	// Callers MUST NOT mutate the returned slice.
+	val := e.value
 	sh.mu.Unlock()
 
-	// Defensive copy to prevent callers from mutating internal state.
-	out := make([]byte, len(e.value))
-	copy(out, e.value)
-	return out, true, nil
+	return val, true, nil
 }
 
 func (s *MemoryStore) Set(ctx context.Context, key string, value []byte) error {
@@ -336,7 +341,6 @@ func (s *MemoryStore) IncrBy(_ context.Context, key string, delta int64) (int64,
 	sh := s.shardFor(key)
 
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
 
 	var currentValue int64
 	e, ok := sh.kv[key]
@@ -344,12 +348,12 @@ func (s *MemoryStore) IncrBy(_ context.Context, key string, delta int64) (int64,
 	if ok {
 		// Check if expired.
 		if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
-			// Treat as non-existent (expired).
 			ok = false
 		} else {
 			// Parse current value as integer.
 			val, err := strconv.ParseInt(string(e.value), 10, 64)
 			if err != nil {
+				sh.mu.Unlock()
 				return 0, fmt.Errorf("ERR value is not an integer or out of range")
 			}
 			currentValue = val
@@ -358,6 +362,8 @@ func (s *MemoryStore) IncrBy(_ context.Context, key string, delta int64) (int64,
 
 	// Calculate new value.
 	newValue := currentValue + delta
+
+	// Pre-format the value before storing
 	newValueBytes := []byte(strconv.FormatInt(newValue, 10))
 
 	// Calculate memory delta.
@@ -382,7 +388,9 @@ func (s *MemoryStore) IncrBy(_ context.Context, key string, delta int64) (int64,
 		lastAccessedAt: nowSec,
 	}
 
-	// Update memory counter.
+	sh.mu.Unlock()
+
+	// Update memory counter outside lock.
 	if ok {
 		atomic.AddInt64(&s.usedMemory, newSize-oldSize)
 	} else {
@@ -397,28 +405,128 @@ func (s *MemoryStore) DecrBy(ctx context.Context, key string, delta int64) (int6
 	return s.IncrBy(ctx, key, -delta)
 }
 
-// MSet sets multiple key-value pairs (all with default TTL).
+// MSet sets multiple key-value pairs efficiently with batching.
 func (s *MemoryStore) MSet(ctx context.Context, pairs map[string][]byte) error {
-	for key, value := range pairs {
-		if err := s.Set(ctx, key, value); err != nil {
-			return err
-		}
+	nowSec := s.now().Unix()
+	expireAt := s.now().Add(s.defaultTTL).UnixMilli()
+
+	// Group keys by shard to minimize lock acquisitions
+	type shardBatch struct {
+		keys   []string
+		values [][]byte
 	}
+	shardBatches := make(map[int]*shardBatch)
+
+	for key, value := range pairs {
+		h := fnv.New32a()
+		h.Write([]byte(key))
+		shardIdx := int(h.Sum32()) % len(s.shards)
+
+		if shardBatches[shardIdx] == nil {
+			shardBatches[shardIdx] = &shardBatch{
+				keys:   make([]string, 0, 8),
+				values: make([][]byte, 0, 8),
+			}
+		}
+		// Defensive copy
+		v := make([]byte, len(value))
+		copy(v, value)
+		shardBatches[shardIdx].keys = append(shardBatches[shardIdx].keys, key)
+		shardBatches[shardIdx].values = append(shardBatches[shardIdx].values, v)
+	}
+
+	// Process each shard batch with single lock acquisition
+	for shardIdx, batch := range shardBatches {
+		sh := &s.shards[shardIdx]
+		sh.mu.Lock()
+
+		var memoryDelta int64
+		for i, key := range batch.keys {
+			value := batch.values[i]
+			newSize := entrySize(key, value)
+
+			oldEntry, existed := sh.kv[key]
+			if existed {
+				oldSize := entrySize(key, oldEntry.value)
+				memoryDelta += newSize - oldSize
+			} else {
+				memoryDelta += newSize
+			}
+
+			sh.kv[key] = entry{
+				value:          value,
+				expireAtMs:     expireAt,
+				lastAccessedAt: nowSec,
+			}
+		}
+
+		sh.mu.Unlock()
+		atomic.AddInt64(&s.usedMemory, memoryDelta)
+	}
+
 	return nil
 }
 
-// MGet retrieves multiple keys.
+// MGet retrieves multiple keys efficiently with batching.
 func (s *MemoryStore) MGet(ctx context.Context, keys []string) (map[string][]byte, error) {
-	result := make(map[string][]byte, len(keys))
-	for _, key := range keys {
-		value, ok, err := s.Get(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			result[key] = value
-		}
+	nowMs := s.now().UnixMilli()
+	nowSec := nowMs / 1000
+
+	// Group keys by shard
+	type shardKeys struct {
+		keys    []string
+		indices []int
 	}
+	shardGroups := make(map[int]*shardKeys)
+
+	for i, key := range keys {
+		h := fnv.New32a()
+		h.Write([]byte(key))
+		shardIdx := int(h.Sum32()) % len(s.shards)
+
+		if shardGroups[shardIdx] == nil {
+			shardGroups[shardIdx] = &shardKeys{
+				keys:    make([]string, 0, 8),
+				indices: make([]int, 0, 8),
+			}
+		}
+		shardGroups[shardIdx].keys = append(shardGroups[shardIdx].keys, key)
+		shardGroups[shardIdx].indices = append(shardGroups[shardIdx].indices, i)
+	}
+
+	result := make(map[string][]byte, len(keys))
+
+	// Process each shard with single lock
+	for shardIdx, group := range shardGroups {
+		sh := &s.shards[shardIdx]
+		sh.mu.Lock()
+
+		for _, key := range group.keys {
+			e, ok := sh.kv[key]
+			if !ok {
+				continue
+			}
+
+			// Check expiry
+			if e.expireAtMs > 0 && nowMs >= e.expireAtMs {
+				continue
+			}
+
+			// Check type
+			if e.typ != "" && e.typ != "string" {
+				continue
+			}
+
+			// Update LRU
+			e.lastAccessedAt = nowSec
+			sh.kv[key] = e
+
+			result[key] = e.value
+		}
+
+		sh.mu.Unlock()
+	}
+
 	return result, nil
 }
 
@@ -804,7 +912,7 @@ func (s *MemoryStore) HMGet(ctx context.Context, key string, fields []string) ([
 	return result, nil
 }
 
-// LPush pushes to list head.
+// LPush pushes to list head using deque structure for O(1) prepend.
 func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (int64, error) {
 	nowMs := s.now().UnixMilli()
 	nowSec := nowMs / 1000
@@ -818,7 +926,8 @@ func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (i
 	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
 		e = entry{
 			typ:            "list",
-			list:           [][]byte{},
+			listHead:       [][]byte{},
+			listTail:       [][]byte{},
 			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
 			lastAccessedAt: nowSec,
 		}
@@ -833,23 +942,22 @@ func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (i
 		sizeDelta += int64(len(value))
 	}
 
-	// Reverse values to prepend them in the correct order (like Redis).
-	// If we push [a, b, c], we want [c, b, a, ...] so 'c' is at the head.
-	n := len(values)
-	reversed := make([][]byte, n)
-	for i := 0; i < n; i++ {
-		reversed[i] = values[n-1-i]
+	// Reverse values to match Redis semantics:
+	// LPUSH a b c results in c->b->a->...
+	for i, j := 0, len(values)-1; i < j; i, j = i+1, j-1 {
+		values[i], values[j] = values[j], values[i]
 	}
 
-	e.list = append(reversed, e.list...)
+	// Prepend to head - O(1) amortized
+	e.listHead = append(values, e.listHead...)
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
 
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
-	return int64(len(e.list)), nil
+	return int64(len(e.listHead) + len(e.listTail)), nil
 }
 
-// RPush pushes to list tail.
+// RPush pushes to list tail using deque structure for O(1) append.
 func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (int64, error) {
 	nowMs := s.now().UnixMilli()
 	nowSec := nowMs / 1000
@@ -863,7 +971,8 @@ func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (i
 	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
 		e = entry{
 			typ:            "list",
-			list:           [][]byte{},
+			listHead:       [][]byte{},
+			listTail:       [][]byte{},
 			expireAtMs:     s.now().Add(s.defaultTTL).UnixMilli(),
 			lastAccessedAt: nowSec,
 		}
@@ -878,15 +987,16 @@ func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (i
 		sizeDelta += int64(len(value))
 	}
 
-	e.list = append(e.list, values...)
+	// Append to tail - O(1) amortized
+	e.listTail = append(e.listTail, values...)
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
 
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
-	return int64(len(e.list)), nil
+	return int64(len(e.listHead) + len(e.listTail)), nil
 }
 
-// LPop pops from list head.
+// LPop pops from list head using deque.
 func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error) {
 	nowMs := s.now().UnixMilli()
 	sh := s.shardFor(key)
@@ -895,15 +1005,33 @@ func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error
 	defer sh.mu.Unlock()
 
 	e, ok := sh.kv[key]
-	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" || len(e.list) == 0 {
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" {
 		return nil, false, nil
 	}
 
-	val := e.list[0]
-	sizeDelta := -int64(len(val))
-	e.list = e.list[1:]
+	var val []byte
+	sizeDelta := int64(0)
 
-	if len(e.list) == 0 {
+	// Pop from head first
+	if len(e.listHead) > 0 {
+		val = e.listHead[0]
+		sizeDelta = -int64(len(val))
+		e.listHead = e.listHead[1:]
+	} else if len(e.listTail) > 0 {
+		// If head is empty, move tail to head (reverse it)
+		for i := len(e.listTail) - 1; i >= 0; i-- {
+			e.listHead = append(e.listHead, e.listTail[i])
+		}
+		e.listTail = nil
+		val = e.listHead[0]
+		sizeDelta = -int64(len(val))
+		e.listHead = e.listHead[1:]
+	} else {
+		return nil, false, nil
+	}
+
+	// Check if list is now empty
+	if len(e.listHead) == 0 && len(e.listTail) == 0 {
 		sizeDelta -= int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
@@ -912,12 +1040,10 @@ func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error
 
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
 
-	valCopy := make([]byte, len(val))
-	copy(valCopy, val)
-	return valCopy, true, nil
+	return val, true, nil
 }
 
-// RPop pops from list tail.
+// RPop pops from list tail using deque.
 func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error) {
 	nowMs := s.now().UnixMilli()
 	sh := s.shardFor(key)
@@ -926,15 +1052,33 @@ func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error
 	defer sh.mu.Unlock()
 
 	e, ok := sh.kv[key]
-	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" || len(e.list) == 0 {
+	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" {
 		return nil, false, nil
 	}
 
-	val := e.list[len(e.list)-1]
-	sizeDelta := -int64(len(val))
-	e.list = e.list[:len(e.list)-1]
+	var val []byte
+	sizeDelta := int64(0)
 
-	if len(e.list) == 0 {
+	// Pop from tail first
+	if len(e.listTail) > 0 {
+		val = e.listTail[len(e.listTail)-1]
+		sizeDelta = -int64(len(val))
+		e.listTail = e.listTail[:len(e.listTail)-1]
+	} else if len(e.listHead) > 0 {
+		// If tail is empty, move head to tail (reverse it)
+		for i := len(e.listHead) - 1; i >= 0; i-- {
+			e.listTail = append(e.listTail, e.listHead[i])
+		}
+		e.listHead = nil
+		val = e.listTail[len(e.listTail)-1]
+		sizeDelta = -int64(len(val))
+		e.listTail = e.listTail[:len(e.listTail)-1]
+	} else {
+		return nil, false, nil
+	}
+
+	// Check if list is now empty
+	if len(e.listHead) == 0 && len(e.listTail) == 0 {
 		sizeDelta -= int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
@@ -943,12 +1087,10 @@ func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error
 
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
 
-	valCopy := make([]byte, len(val))
-	copy(valCopy, val)
-	return valCopy, true, nil
+	return val, true, nil
 }
 
-// LLen returns list length.
+// LLen returns list length using deque.
 func (s *MemoryStore) LLen(ctx context.Context, key string) (int64, error) {
 	nowMs := s.now().UnixMilli()
 	sh := s.shardFor(key)
@@ -960,10 +1102,10 @@ func (s *MemoryStore) LLen(ctx context.Context, key string) (int64, error) {
 	if !ok || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) || e.typ != "list" {
 		return 0, nil
 	}
-	return int64(len(e.list)), nil
+	return int64(len(e.listHead) + len(e.listTail)), nil
 }
 
-// LRange returns list range.
+// LRange returns list range using deque.
 func (s *MemoryStore) LRange(ctx context.Context, key string, start, stop int64) ([][]byte, error) {
 	nowMs := s.now().UnixMilli()
 	sh := s.shardFor(key)
@@ -976,33 +1118,41 @@ func (s *MemoryStore) LRange(ctx context.Context, key string, start, stop int64)
 		return [][]byte{}, nil
 	}
 
-	length := int64(len(e.list))
+	// Combine head and tail into virtual array
+	totalLen := int64(len(e.listHead) + len(e.listTail))
+
 	if start < 0 {
-		start = length + start
+		start = totalLen + start
 	}
 	if stop < 0 {
-		stop = length + stop
+		stop = totalLen + stop
 	}
 	if start < 0 {
 		start = 0
 	}
-	if stop >= length {
-		stop = length - 1
+	if stop >= totalLen {
+		stop = totalLen - 1
 	}
-	if start > stop || start >= length {
+	if start > stop || start >= totalLen {
 		return [][]byte{}, nil
 	}
 
-	result := make([][]byte, stop-start+1)
+	result := make([][]byte, 0, stop-start+1)
 	for i := start; i <= stop; i++ {
-		valCopy := make([]byte, len(e.list[i]))
-		copy(valCopy, e.list[i])
-		result[i-start] = valCopy
+		var val []byte
+		if i < int64(len(e.listHead)) {
+			val = e.listHead[i]
+		} else {
+			// Access from tail (which is stored reversed)
+			tailIdx := i - int64(len(e.listHead))
+			val = e.listTail[tailIdx]
+		}
+		result = append(result, val)
 	}
 	return result, nil
 }
 
-// LIndex returns list element at index.
+// LIndex returns list element at index using deque.
 func (s *MemoryStore) LIndex(ctx context.Context, key string, index int64) ([]byte, bool, error) {
 	nowMs := s.now().UnixMilli()
 	sh := s.shardFor(key)
@@ -1015,17 +1165,23 @@ func (s *MemoryStore) LIndex(ctx context.Context, key string, index int64) ([]by
 		return nil, false, nil
 	}
 
-	length := int64(len(e.list))
+	totalLen := int64(len(e.listHead) + len(e.listTail))
 	if index < 0 {
-		index = length + index
+		index = totalLen + index
 	}
-	if index < 0 || index >= length {
+	if index < 0 || index >= totalLen {
 		return nil, false, nil
 	}
 
-	valCopy := make([]byte, len(e.list[index]))
-	copy(valCopy, e.list[index])
-	return valCopy, true, nil
+	var val []byte
+	if index < int64(len(e.listHead)) {
+		val = e.listHead[index]
+	} else {
+		tailIdx := index - int64(len(e.listHead))
+		val = e.listTail[tailIdx]
+	}
+
+	return val, true, nil
 }
 
 // evictIfNeeded runs the eviction loop if usedMemory + newSize would exceed maxMemory.

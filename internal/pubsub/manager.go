@@ -11,6 +11,7 @@ type Manager struct {
 	mu          sync.RWMutex
 	channels    map[string]*channel      // channel name -> subscribers
 	patterns    map[string]*patternSub   // pattern -> subscribers
+	patternTrie *PatternTrie             // trie for fast pattern matching
 	subscribers map[*Subscriber]struct{} // all active subscribers
 	totalMsgs   int64                    // stats: total messages published
 	totalSubs   int64                    // stats: total active subscriptions
@@ -37,6 +38,7 @@ func NewManager() *Manager {
 	return &Manager{
 		channels:    make(map[string]*channel),
 		patterns:    make(map[string]*patternSub),
+		patternTrie: NewPatternTrie(),
 		subscribers: make(map[*Subscriber]struct{}),
 	}
 }
@@ -83,6 +85,7 @@ func (m *Manager) PSubscribe(sub *Subscriber, patterns ...string) []string {
 				subscribers: make(map[*Subscriber]struct{}),
 			}
 			m.patterns[patName] = pat
+			m.patternTrie.Insert(patName, pat) // Add to trie
 		}
 
 		if _, exists := pat.subscribers[sub]; !exists {
@@ -155,6 +158,7 @@ func (m *Manager) PUnsubscribe(sub *Subscriber, patterns ...string) []string {
 			// Clean up empty patterns
 			if len(pat.subscribers) == 0 {
 				delete(m.patterns, patName)
+				m.patternTrie.Remove(patName) // Remove from trie
 			}
 		}
 	}
@@ -172,10 +176,10 @@ func (m *Manager) PUnsubscribe(sub *Subscriber, patterns ...string) []string {
 func (m *Manager) Publish(ctx context.Context, channel string, payload []byte) int64 {
 	m.mu.RLock()
 
-	// Collect channel subscribers  
+	// Collect channel subscribers
 	var subs []*Subscriber
 	subsMap := make(map[*Subscriber]struct{}) // For O(1) duplicate detection
-	
+
 	if ch, ok := m.channels[channel]; ok {
 		subs = make([]*Subscriber, 0, len(ch.subscribers))
 		for sub := range ch.subscribers {
@@ -184,14 +188,13 @@ func (m *Manager) Publish(ctx context.Context, channel string, payload []byte) i
 		}
 	}
 
-	// Collect pattern subscribers (avoiding duplicates with map lookup)
-	for patName, pat := range m.patterns {
-		if matchPattern(patName, channel) {
-			for sub := range pat.subscribers {
-				if _, exists := subsMap[sub]; !exists {
-					subs = append(subs, sub)
-					subsMap[sub] = struct{}{}
-				}
+	// Use fast pattern matching with trie (O(k) instead of O(n))
+	matchedPatterns := m.patternTrie.MatchAll(channel)
+	for _, pat := range matchedPatterns {
+		for sub := range pat.subscribers {
+			if _, exists := subsMap[sub]; !exists {
+				subs = append(subs, sub)
+				subsMap[sub] = struct{}{}
 			}
 		}
 	}
@@ -202,7 +205,6 @@ func (m *Manager) Publish(ctx context.Context, channel string, payload []byte) i
 		return 0
 	}
 
-	// Create message (reuse from pool)
 	// Create message directly (no pooling for safety)
 	msg := &Message{
 		Channel: channel,

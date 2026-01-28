@@ -141,6 +141,9 @@ func main() {
 	tester.Run("WRONGTYPE", []string{"LPUSH", "listkey", "v"}, "1")
 	tester.Run("GET WRONGTYPE", []string{"GET", "listkey"}, "ERR") // GET on list? -> MemoryStore.Get returns value?
 
+	// --- PUB/SUB ---
+	tester.Run("PUBLISH no subs", []string{"PUBLISH", "chan1", "hello"}, "0")
+
 	fmt.Printf("\nSummary: %d passed, %d failed\n", tester.passed, tester.failed)
 	if tester.failed > 0 {
 		os.Exit(1)
