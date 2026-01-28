@@ -1,6 +1,6 @@
 {
   "name": "moledb",
-  "version": "0.1.3",
+  "version": "0.1.5",
 
 
   "description": "Fast, lightweight in-memory database. Redis-compatible protocol with persistence, replication, and Sentinel support.",
@@ -13,8 +13,7 @@
     "nosql"
   ],
   "bin": {
-    "mole": "./bin/mole",
-    "mole-cli": "./bin/mole-cli"
+    "mole": "./bin/mole"
   },
   "scripts": {
     "postinstall": "node install.js"

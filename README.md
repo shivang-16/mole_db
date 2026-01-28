@@ -12,6 +12,7 @@ Fast, in-memory key-value cache server written in Go. RESP-compatible protocol w
 - **Sentinel failover** for automatic master promotion
 - **Binary-safe** values
 - **29 commands** including strings, hashes, lists, counters
+- **Pub/Sub messaging** with pattern matching for real-time events
 
 ## Installation
 
@@ -29,27 +30,53 @@ This installs pre-compiled binaries for your platform (macOS, Linux, Windows).
 git clone https://github.com/shivang-16/mole_db.git
 cd mole_db
 go build -o mole ./cmd/mole
-go build -o mole-cli ./cmd/mole-cli
+go build -o mole ./cmd/mole
 ```
 
 ## Quick Start
 
+### Interactive Mode (Easiest)
 ```bash
-# Start server (default port 7379)
-mole
+# Install via npm
+npm install -g moledb
 
-# Connect with CLI
-mole-cli
+# Start interactive mode (server + client in one)
+mole
+# OR
+mole server
 127.0.0.1:7379> SET mykey "Hello World"
 OK
 127.0.0.1:7379> GET mykey
 "Hello World"
 ```
 
-### With custom config
-
+### Daemon Mode
 ```bash
-mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
+# Start daemon server (background)
+mole server -d
+# OR
+mole -d
+
+# Connect to running server
+mole connect
+127.0.0.1:7379> SET mykey "Hello World"
+OK
+```
+
+### Smart Connect
+```bash
+# Try to connect to existing server, fallback to interactive mode
+mole connect
+# If server exists: connects as client
+# If no server: starts interactive mode
+```
+
+### From Source
+```bash
+git clone https://github.com/shivang-16/mole_db.git
+cd mole_db
+go build -o mole ./cmd/mole
+./mole
 ```
 
 ## Commands
@@ -104,6 +131,16 @@ mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 - `LLEN key` - Get list length
 - `LRANGE key start stop` - Get list range
 
+### Pub/Sub Messaging
+- `MOLE.PUB channel message` - Publish message to channel
+- `MOLE.SUB channel [channel ...]` - Subscribe to channels
+- `MOLE.PSUB pattern [pattern ...]` - Subscribe to patterns (supports `*` and `?`)
+- `MOLE.UNSUB [channel ...]` - Unsubscribe from channels
+- `MOLE.PUNSUB [pattern ...]` - Unsubscribe from patterns
+- `MOLE.PUBSUB CHANNELS [pattern]` - List active channels
+- `MOLE.PUBSUB NUMSUB [channel ...]` - Get subscriber count per channel
+- `MOLE.PUBSUB NUMPAT` - Get total pattern subscriptions
+
 ## Architecture
 
 ```
@@ -119,6 +156,10 @@ mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 │  ├─ Hashes                          │
 │  └─ Lists                           │
 ├─────────────────────────────────────┤
+│  Pub/Sub Manager (Zero-Copy)        │
+│  ├─ Channel Subscriptions           │
+│  └─ Pattern Matching (Trie-based)   │
+├─────────────────────────────────────┤
 │  AOF Persistence (optional)         │
 ├─────────────────────────────────────┤
 │  Replication (Master/Replica)       │
@@ -127,17 +168,26 @@ mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 
 ## Configuration
 
+### Server Options
 ```bash
+mole server [options]
+
 -addr string              # TCP address (default "127.0.0.1:7379")
--default-ttl duration     # Default TTL (default 480h = 20 days)
--max-ttl duration         # Max TTL cap (default 480h = 20 days)
--maxmemory int            # Max memory in bytes (0 = no limit)
--maxmemory-policy string  # Eviction policy: noeviction|allkeys-lru
+-d                        # Run in daemon mode (background)
 -aof                      # Enable AOF persistence
 -aof-path string          # AOF file path (default "mole.aof")
--aof-fsync string         # Sync policy: always|everysec|no
+-maxmemory int            # Max memory in bytes (0 = no limit)
+-maxmemory-policy string  # Eviction policy: noeviction|allkeys-lru
 -role string              # Server role: master|replica
 -master-addr string       # Master address (for replicas)
+```
+
+### Connect Options
+```bash
+mole connect [options]
+
+-h string                 # Server host (default "127.0.0.1")
+-p int                    # Server port (default 7379)
 ```
 
 ## Replication
@@ -145,10 +195,10 @@ mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 ### Master-Replica Setup
 ```bash
 # Start master
-./mole -role master -addr 127.0.0.1:7379
+mole server -role master -addr 127.0.0.1:7379
 
 # Start replica
-./mole -role replica -master-addr 127.0.0.1:7379 -addr 127.0.0.1:7380
+mole server -role replica -master-addr 127.0.0.1:7379 -addr 127.0.0.1:7380
 ```
 
 ### Sentinel Failover
@@ -167,6 +217,44 @@ mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 - **Real-time analytics** - Event counting
 - **Cache layer** - Database query caching
 - **Message queues** - List-based queues
+- **Pub/Sub messaging** - Real-time notifications and chat systems
+
+## Pub/Sub Examples
+
+### Terminal 1 - Subscribe to channels
+```bash
+mole connect
+127.0.0.1:7379> SUB news sports
+Subscribed to news (total: 1)
+Subscribed to sports (total: 2)
+Entering subscription mode. Press Ctrl+C to exit.
+```
+
+### Terminal 2 - Publish messages
+```bash
+mole connect
+127.0.0.1:7379> PUB news "Breaking: Mole DB released!"
+(integer) 1
+127.0.0.1:7379> PUB sports "Game starts at 3pm"
+(integer) 1
+```
+
+### Terminal 1 - Receives messages
+```
+[14:30:15] news: Breaking: Mole DB released!
+[14:30:20] sports: Game starts at 3pm
+```
+
+### Pattern Subscriptions
+```bash
+# Subscribe to all user events
+127.0.0.1:7379> MOLE.PSUB user:*
+Subscribed to user:* (total: 1)
+
+# Publish to specific user
+127.0.0.1:7379> MOLE.PUB user:123 "logged in"
+(integer) 1  # Delivered to pattern subscriber
+```
 
 ## Performance
 
@@ -174,6 +262,9 @@ mole -addr 127.0.0.1:7379 -maxmemory 1073741824 -aof
 - **O(1) operations** - Most commands are constant time
 - **Low latency** - In-memory operations
 - **Batch operations** - MGET/MSET reduce round-trips by 10x
+- **Zero-copy pub/sub** - Message delivery via pointer sharing
+- **Non-blocking publishes** - Slow subscribers don't affect publishers
+- **Pattern matching** - O(1) trie-based channel matching
 
 ## Contributing
 

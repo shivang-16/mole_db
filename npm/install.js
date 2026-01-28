@@ -33,8 +33,7 @@ const isWindows = platform === 'windows';
 const ext = isWindows ? '.exe' : '';
 
 const binaries = [
-    { name: 'mole', remote: `mole-${platform}-${arch}${ext}` },
-    { name: 'mole-cli', remote: `mole-cli-${platform}-${arch}${ext}` }
+    { name: 'mole', remote: `mole-${platform}-${arch}${ext}` }
 ];
 
 console.log(`\n📦 Installing Mole DB v${VERSION} for ${platform}/${arch}...\n`);
@@ -108,9 +107,10 @@ Promise.all(binaries.map(downloadBinary))
     .then(() => {
         console.log('\n✨ Mole DB installed successfully!\n');
         console.log('Usage:');
-        console.log('  mole -i           # Start server with interactive mode');
-        console.log('  mole              # Start server only');
-        console.log('  mole-cli          # Connect to running server\n');
+        console.log('  mole                  # Start interactive mode (server + client)');
+        console.log('  mole server -d        # Start server daemon');
+        console.log('  mole cli              # Connect to running server');
+        console.log('  mole help             # Show help\n');
     })
     .catch((err) => {
         console.error(`\n❌ Installation failed: ${err.message}\n`);
