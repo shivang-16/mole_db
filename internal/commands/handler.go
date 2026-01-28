@@ -741,7 +741,7 @@ func (h *Handler) Handle(ctx context.Context, args [][]byte) resp.Reply {
 		}
 		return resp.Array(result)
 
-	case "PUB", "MOLE.PUB":
+	case "PUBLISH", "PUB", "MOLE.PUB", "MOLE.PUBLISH":
 		if len(args) != 3 {
 			return resp.Error("ERR wrong number of arguments for 'PUB'")
 		}
