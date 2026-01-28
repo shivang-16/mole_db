@@ -75,8 +75,8 @@ func NewMemoryStore(opts MemoryStoreOptions) *MemoryStore {
 
 type entry struct {
 	value          []byte
-	expireAtMs     int64 // unix millis; 0 means no expiry
-	lastAccessedAt int64 // unix seconds (for LRU)
+	expireAtMs     int64  // unix millis; 0 means no expiry
+	lastAccessedAt int64  // unix seconds (for LRU)
 	typ            string // "string", "hash", "list"
 	hash           map[string][]byte
 	list           [][]byte
@@ -145,6 +145,12 @@ func (s *MemoryStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 			return nil, false, nil
 		}
 		e = e2
+	}
+
+	// Check type.
+	if e.typ != "" && e.typ != "string" {
+		sh.mu.Unlock()
+		return nil, false, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
 	// Update LRU access time.
@@ -320,7 +326,7 @@ func (s *MemoryStore) Incr(ctx context.Context, key string) (int64, error) {
 
 // Decr decrements the integer value of key by 1.
 func (s *MemoryStore) Decr(ctx context.Context, key string) (int64, error) {
-	return s.DecrBy(ctx, key, -1)
+	return s.DecrBy(ctx, key, 1)
 }
 
 // IncrBy increments the integer value of key by delta.
@@ -582,7 +588,7 @@ func (s *MemoryStore) HSet(ctx context.Context, key, field string, value []byte)
 	e, exists := sh.kv[key]
 	isNew := false
 	var sizeDelta int64
-	
+
 	if !exists || (e.expireAtMs > 0 && nowMs >= e.expireAtMs) {
 		e = entry{
 			typ:            "hash",
@@ -611,7 +617,7 @@ func (s *MemoryStore) HSet(ctx context.Context, key, field string, value []byte)
 		sizeDelta += int64(len(field)) + int64(len(value))
 		isNew = true
 	}
-	
+
 	e.hash[field] = value
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
@@ -637,7 +643,7 @@ func (s *MemoryStore) HGet(ctx context.Context, key, field string) ([]byte, bool
 	if !exists {
 		return nil, false, nil
 	}
-	
+
 	result := make([]byte, len(val))
 	copy(result, val)
 	return result, true, nil
@@ -694,7 +700,7 @@ func (s *MemoryStore) HDel(ctx context.Context, key string, fields []string) (in
 	} else {
 		sh.kv[key] = e
 	}
-	
+
 	atomic.AddInt64(&s.usedMemory, -freedMemory)
 	return count, nil
 }
@@ -827,10 +833,18 @@ func (s *MemoryStore) LPush(ctx context.Context, key string, values [][]byte) (i
 		sizeDelta += int64(len(value))
 	}
 
-	e.list = append(values, e.list...)
+	// Reverse values to prepend them in the correct order (like Redis).
+	// If we push [a, b, c], we want [c, b, a, ...] so 'c' is at the head.
+	n := len(values)
+	reversed := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		reversed[i] = values[n-1-i]
+	}
+
+	e.list = append(reversed, e.list...)
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
-	
+
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
 	return int64(len(e.list)), nil
 }
@@ -867,7 +881,7 @@ func (s *MemoryStore) RPush(ctx context.Context, key string, values [][]byte) (i
 	e.list = append(e.list, values...)
 	e.lastAccessedAt = nowSec
 	sh.kv[key] = e
-	
+
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
 	return int64(len(e.list)), nil
 }
@@ -888,16 +902,16 @@ func (s *MemoryStore) LPop(ctx context.Context, key string) ([]byte, bool, error
 	val := e.list[0]
 	sizeDelta := -int64(len(val))
 	e.list = e.list[1:]
-	
+
 	if len(e.list) == 0 {
 		sizeDelta -= int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
 		sh.kv[key] = e
 	}
-	
+
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
-	
+
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
 	return valCopy, true, nil
@@ -919,16 +933,16 @@ func (s *MemoryStore) RPop(ctx context.Context, key string) ([]byte, bool, error
 	val := e.list[len(e.list)-1]
 	sizeDelta := -int64(len(val))
 	e.list = e.list[:len(e.list)-1]
-	
+
 	if len(e.list) == 0 {
 		sizeDelta -= int64(len(key)) + 48
 		delete(sh.kv, key)
 	} else {
 		sh.kv[key] = e
 	}
-	
+
 	atomic.AddInt64(&s.usedMemory, sizeDelta)
-	
+
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
 	return valCopy, true, nil

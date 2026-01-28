@@ -59,14 +59,108 @@ func main() {
 			break
 		}
 
-		// Simple split by space (quoted strings handling is basic here for MVP)
-		args := strings.Fields(input)
+		// Parse input respecting quoted strings.
+		args := parseInput(input)
+		if len(args) == 0 {
+			continue
+		}
 		if err := sendCommand(conn, args); err != nil {
 			fmt.Printf("Error sending command: %v\n", err)
 			continue
 		}
 		readResponse(conn)
 	}
+}
+
+// parseInput tokenizes user input respecting quoted strings.
+func parseInput(input string) []string {
+	var args []string
+	i := 0
+	n := len(input)
+
+	for i < n {
+		// Skip whitespace.
+		for i < n && (input[i] == ' ' || input[i] == '\t') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+
+		var token string
+		switch input[i] {
+		case '"':
+			token, i = parseDoubleQuoted(input, i)
+		case '\'':
+			token, i = parseSingleQuoted(input, i)
+		default:
+			token, i = parseUnquoted(input, i)
+		}
+		args = append(args, token)
+	}
+	return args
+}
+
+// parseDoubleQuoted parses a double-quoted string with escape sequences.
+func parseDoubleQuoted(input string, start int) (string, int) {
+	n := len(input)
+	i := start + 1
+	var result strings.Builder
+
+	for i < n {
+		ch := input[i]
+		if ch == '"' {
+			return result.String(), i + 1
+		}
+		if ch == '\\' && i+1 < n {
+			i++
+			switch input[i] {
+			case 'n':
+				result.WriteByte('\n')
+			case 'r':
+				result.WriteByte('\r')
+			case 't':
+				result.WriteByte('\t')
+			case '\\':
+				result.WriteByte('\\')
+			case '"':
+				result.WriteByte('"')
+			default:
+				result.WriteByte(input[i])
+			}
+		} else {
+			result.WriteByte(ch)
+		}
+		i++
+	}
+	// Unclosed quote - return what we have.
+	return result.String(), i
+}
+
+// parseSingleQuoted parses a single-quoted string (no escape processing).
+func parseSingleQuoted(input string, start int) (string, int) {
+	n := len(input)
+	i := start + 1
+	var result strings.Builder
+
+	for i < n {
+		if input[i] == '\'' {
+			return result.String(), i + 1
+		}
+		result.WriteByte(input[i])
+		i++
+	}
+	return result.String(), i
+}
+
+// parseUnquoted parses an unquoted token until whitespace.
+func parseUnquoted(input string, start int) (string, int) {
+	n := len(input)
+	i := start
+	for i < n && input[i] != ' ' && input[i] != '\t' {
+		i++
+	}
+	return input[start:i], i
 }
 
 func sendCommand(conn net.Conn, args []string) error {

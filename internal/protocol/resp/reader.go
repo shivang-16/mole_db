@@ -94,15 +94,136 @@ func (rr *Reader) readInline() ([][]byte, error) {
 	if len(line) == 0 {
 		return nil, fmt.Errorf("%w: empty command", ErrProtocol)
 	}
-	parts := bytes.Fields(line)
-	out := make([][]byte, 0, len(parts))
-	for _, p := range parts {
-		// Create independent copy to avoid buffer reuse issues.
-		copied := make([]byte, len(p))
-		copy(copied, p)
-		out = append(out, copied)
+	return tokenizeInline(line)
+}
+
+// tokenizeInline parses an inline command respecting quoted strings.
+func tokenizeInline(line []byte) ([][]byte, error) {
+	var out [][]byte
+	i := 0
+	n := len(line)
+
+	for i < n {
+		// Skip whitespace between tokens.
+		for i < n && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+
+		var token []byte
+		var err error
+
+		switch line[i] {
+		case '"':
+			token, i, err = parseDoubleQuoted(line, i)
+		case '\'':
+			token, i, err = parseSingleQuoted(line, i)
+		default:
+			token, i = parseUnquoted(line, i)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, token)
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: empty command", ErrProtocol)
 	}
 	return out, nil
+}
+
+// parseDoubleQuoted parses a double-quoted string with escape sequences.
+func parseDoubleQuoted(line []byte, start int) ([]byte, int, error) {
+	n := len(line)
+	i := start + 1 // skip opening quote
+	var buf []byte
+
+	for i < n {
+		ch := line[i]
+		if ch == '"' {
+			return buf, i + 1, nil
+		}
+		if ch == '\\' && i+1 < n {
+			i++
+			switch line[i] {
+			case 'n':
+				buf = append(buf, '\n')
+			case 'r':
+				buf = append(buf, '\r')
+			case 't':
+				buf = append(buf, '\t')
+			case '\\':
+				buf = append(buf, '\\')
+			case '"':
+				buf = append(buf, '"')
+			case 'x':
+				// Hex escape: \xNN
+				if i+2 < n {
+					hex := line[i+1 : i+3]
+					if val, err := parseHexByte(hex); err == nil {
+						buf = append(buf, val)
+						i += 2
+					} else {
+						buf = append(buf, '\\', 'x')
+					}
+				} else {
+					buf = append(buf, '\\', 'x')
+				}
+			default:
+				// Unknown escape, keep as-is.
+				buf = append(buf, line[i])
+			}
+		} else {
+			buf = append(buf, ch)
+		}
+		i++
+	}
+	return nil, start, fmt.Errorf("%w: unclosed double quote", ErrProtocol)
+}
+
+// parseSingleQuoted parses a single-quoted string (no escape processing).
+func parseSingleQuoted(line []byte, start int) ([]byte, int, error) {
+	n := len(line)
+	i := start + 1 // skip opening quote
+	var buf []byte
+
+	for i < n {
+		ch := line[i]
+		if ch == '\'' {
+			return buf, i + 1, nil
+		}
+		buf = append(buf, ch)
+		i++
+	}
+	return nil, start, fmt.Errorf("%w: unclosed single quote", ErrProtocol)
+}
+
+// parseUnquoted parses an unquoted token (until whitespace).
+func parseUnquoted(line []byte, start int) ([]byte, int) {
+	n := len(line)
+	i := start
+	for i < n && line[i] != ' ' && line[i] != '\t' {
+		i++
+	}
+	token := make([]byte, i-start)
+	copy(token, line[start:i])
+	return token, i
+}
+
+// parseHexByte parses a 2-character hex string into a byte.
+func parseHexByte(hex []byte) (byte, error) {
+	if len(hex) != 2 {
+		return 0, fmt.Errorf("invalid hex")
+	}
+	val, err := strconv.ParseUint(string(hex), 16, 8)
+	if err != nil {
+		return 0, err
+	}
+	return byte(val), nil
 }
 
 func (rr *Reader) readLine() ([]byte, error) {
